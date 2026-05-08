@@ -68,7 +68,7 @@ class MLTrainer:
         X_test_processed = X_test.copy()
         
         # Logistic Regression requires scaling
-        if model_type == "Logistic Regression":
+        if model_type in ("Logistic Regression", "GAM"):
             scaler = StandardScaler()
             X_train_processed = scaler.fit_transform(X_train_processed)
             X_test_processed = scaler.transform(X_test_processed)
@@ -120,11 +120,12 @@ class MLTrainer:
         
         return grid_search.best_estimator_, grid_search.best_params_
     
-    def _train_direct(self, model, X_train, Y_train):
+    def _train_direct(self, model, X_train, Y_train, feature_names=None):
         """ Direct training with grid_search = False."""
-        #print(f"[Direct Training] Using default parameters for model: {self.model_type}")
-        
-        model.fit(X_train, Y_train)
+        fit_kwargs = {}
+        if self.model_type == "GAM" and feature_names is not None:
+            fit_kwargs["feature_names"] = list(feature_names)
+        model.fit(X_train, Y_train, **fit_kwargs)
         model_params = model.get_params()
         
         return model, model_params

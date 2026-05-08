@@ -78,3 +78,16 @@ CatBoost:
     depth: [4, 6, 8]
     n_estimators: [200, 300, 500]
 
+GAM:
+  default:
+    lam: 30.0
+    n_splines: 4
+    spline_order: 3
+    max_iter: 200
+
+  grid_search:
+    lam: [10.0, 20.0, 40.0]
+    n_splines: [4, 6]
+    spline_order: [3]
+    max_iter: [150]
+

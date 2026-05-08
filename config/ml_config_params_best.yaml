@@ -108,3 +108,14 @@ CatBoost:
     learning_rate: 0.03
     n_estimators: 500
 
+GAM:
+  mimic_cohort_NF_30_days:
+    lam: 20.0
+    n_splines: 5
+    spline_order: 3
+    max_iter: 150
+  mimic_cohort_aplasia_45_days:
+    lam: 30.0
+    n_splines: 4
+    spline_order: 3
+    max_iter: 150

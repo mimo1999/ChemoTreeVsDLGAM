@@ -8,17 +8,19 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 import os
 from config.constants import MODEL_PARAMS, BEST_PARAMS, RANDOM_SEED
+from ml_model_training.gam_wrapper import LogisticGAMClassifier
 
 
 class MLModelFactory:
     """Factory class to create ML models."""
-    
+
     MODEL_CLASSES = {
         'logistic_regression': LogisticRegression,
         'random_forest': RandomForestClassifier,
         'gradient_boosting': HistGradientBoostingClassifier,
         'xgboost': xgb.XGBClassifier,
-        'catboost': CatBoostClassifier
+        'catboost': CatBoostClassifier,
+        'gam': LogisticGAMClassifier,
     }
     
     @classmethod

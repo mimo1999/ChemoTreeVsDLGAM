@@ -38,7 +38,7 @@ class Generator():
         self.hids=self.admissions['hadm_id'].unique()
         self.pts =self.admissions['subject_id'].unique()
         if(self.feat_cond):
-            self.cond=self.cond[self.cond['hadm_id'].isin(self.admissiions['hadm_id'])]
+            self.cond=self.cond[self.cond['hadm_id'].isin(self.admissions['hadm_id'])]
             
         
         print("[ READ ALL FEATURES ]")

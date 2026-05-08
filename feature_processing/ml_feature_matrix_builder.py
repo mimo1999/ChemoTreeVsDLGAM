@@ -11,6 +11,105 @@ from typing import Tuple, List, Optional, Dict, Any
 from abc import ABC, abstractmethod
 
 
+# ---------------------------------------------------------------------------
+# Approach A — Temporal Bin Aggregation with Missingness Preservation
+# ---------------------------------------------------------------------------
+#
+# Three day-bins partition the 15-day observation window:
+#   B1: days 1-5   (bin indices 0..4)
+#   B2: days 6-10  (bin indices 5..9)
+#   B3: days 11-15 (bin indices 10..14)
+#
+# For each (admission, itemid, B-bin) we emit five features:
+#   mean, delta, observed_fraction, last_value, observation_center
+#
+# Missing days remain NaN throughout aggregation — there is no forward-fill,
+# backward-fill, or zero imputation, so missingness is clinically informative.
+
+A_BINS: Tuple[Tuple[str, Tuple[int, ...]], ...] = (
+    ("B1", (0, 1, 2, 3, 4)),
+    ("B2", (5, 6, 7, 8, 9)),
+    ("B3", (10, 11, 12, 13, 14)),
+)
+
+A_FEATURES: Tuple[str, ...] = (
+    "mean",
+    "delta",
+    "observed_fraction",
+    "last_value",
+    "observation_center",
+)
+
+
+def _compute_a_bin_features(values: np.ndarray, bin_size: int) -> Dict[str, np.ndarray]:
+    """Compute the five Approach-A features for one (lab, B-bin) block.
+
+    Parameters
+    ----------
+    values : np.ndarray of shape (n_rows, bin_size)
+        Lab values within this B-bin. NaN means the lab was not measured on that day.
+    bin_size : int
+        Number of calendar days the bin spans (denominator of ``observed_fraction``
+        and normalizer for ``observation_center``).
+
+    Returns
+    -------
+    dict with keys ``mean, delta, observed_fraction, last_value, observation_center``.
+    Each is a float64 array of length ``n_rows``. Empty rows produce NaN for all
+    features except ``observed_fraction`` (always numeric, 0.0 when empty).
+    Single-observation rows have ``delta == 0.0`` per spec.
+    """
+    if values.shape[1] != bin_size:
+        raise ValueError(
+            f"values has {values.shape[1]} columns but bin_size={bin_size}"
+        )
+
+    n_rows = values.shape[0]
+    mask = ~np.isnan(values)
+    n_obs = mask.sum(axis=1)
+    has_any = n_obs > 0
+
+    observed_fraction = n_obs.astype(np.float64) / float(bin_size)
+
+    mean = np.full(n_rows, np.nan, dtype=np.float64)
+    if has_any.any():
+        with np.errstate(invalid="ignore"):
+            sums = np.where(mask, values, 0.0).sum(axis=1)
+            mean[has_any] = sums[has_any] / n_obs[has_any]
+
+    first_idx = np.full(n_rows, -1, dtype=np.int64)
+    last_idx = np.full(n_rows, -1, dtype=np.int64)
+    if has_any.any():
+        first_idx[has_any] = np.argmax(mask[has_any], axis=1)
+        last_idx[has_any] = bin_size - 1 - np.argmax(mask[has_any][:, ::-1], axis=1)
+
+    last_value = np.full(n_rows, np.nan, dtype=np.float64)
+    delta = np.full(n_rows, np.nan, dtype=np.float64)
+    if has_any.any():
+        rows = np.where(has_any)[0]
+        last_value[rows] = values[rows, last_idx[rows]]
+        first_vals = values[rows, first_idx[rows]]
+        single = n_obs[rows] == 1
+        delta[rows] = np.where(single, 0.0, last_value[rows] - first_vals)
+
+    observation_center = np.full(n_rows, np.nan, dtype=np.float64)
+    if has_any.any():
+        if bin_size > 1:
+            norm_positions = np.arange(bin_size, dtype=np.float64) / float(bin_size - 1)
+        else:
+            norm_positions = np.array([0.5], dtype=np.float64)
+        weighted = np.where(mask, norm_positions[None, :], 0.0).sum(axis=1)
+        observation_center[has_any] = weighted[has_any] / n_obs[has_any]
+
+    return {
+        "mean": mean,
+        "delta": delta,
+        "observed_fraction": observed_fraction,
+        "last_value": last_value,
+        "observation_center": observation_center,
+    }
+
+
 class BaseFeatureExtractor(ABC):
     """Base class for feature extractors."""
     
@@ -199,6 +298,40 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
             #print("Feature selection applied (Top 100 features in cancer chemo cohort), Threshold:", len(selected_features))
             data = data[data["itemid"].isin(selected_features)]
 
+        # ------------------------------------------------------------------
+        # Approach A short-circuits the V/M/D pipeline: it operates directly
+        # on the long-format ``data`` DataFrame *without any imputation* and
+        # produces three-bin-aggregated features per (admission, itemid).
+        # ------------------------------------------------------------------
+        if feat_type == "A":
+            if itemids is None and bins is None:
+                a_df, all_itemids, all_bins = self._compute_a_features(
+                    data, target_cohort, return_itemids_bins=True,
+                )
+            else:
+                a_df = self._compute_a_features(
+                    data, target_cohort, itemids=itemids, bins=bins,
+                )
+
+            a_df = a_df.reindex(hadm_ids)
+            X_df = pd.concat(
+                [a_df.reset_index(drop=True), demo.reset_index(drop=True)],
+                axis=1,
+            )
+
+            if itemids is None and bins is None:
+                return (
+                    X_df, y_df,
+                    pd.Series(subject_ids, name="subject_id"),
+                    pd.Series(hadm_ids, name="hadm_id"),
+                    all_itemids, all_bins,
+                )
+            return (
+                X_df, y_df,
+                pd.Series(subject_ids, name="subject_id"),
+                pd.Series(hadm_ids, name="hadm_id"),
+            )
+
         # Extract itemids and bins from training data or use provided ones
         if itemids is None and bins is None:
             # Training: extract itemids and bins
@@ -315,7 +448,116 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
         else:
             return x_df, m_df, delta_df
     
-    def _combine_feature_types(self, x_df: pd.DataFrame, m_df: pd.DataFrame, delta_df: pd.DataFrame, 
+    def _compute_a_features(self, data: pd.DataFrame, target_cohort: str,
+                            return_itemids_bins: bool = False,
+                            itemids: list = None, bins: list = None):
+        """Approach A — Temporal Bin Aggregation with Missingness Preservation.
+
+        For every (admission, itemid) pair, summarize *observed* values inside
+        three consecutive day bins (B1/B2/B3 — see ``A_BINS`` at module
+        level). Each bin emits five features: mean, delta, observed_fraction,
+        last_value, observation_center.
+
+        Missing days remain NaN throughout aggregation — there is *no*
+        forward-fill, backward-fill, or zero imputation, so missingness is
+        clinically informative. Every (lab, B-bin) pair therefore yields a
+        column ``"<itemid>_B<bin>_<feature>"``.
+
+        Parameters
+        ----------
+        data : DataFrame
+            Long format with columns ``hadm_id, itemid, bin, value`` (the same
+            shape consumed by ``_compute_vmd_features``).
+        return_itemids_bins : bool
+            If True, also return the discovered itemids / bin indices so that
+            val/test folds can be aligned with the train fold.
+        itemids, bins : optional
+            When supplied, reuse those itemids / bin indices instead of
+            re-discovering them (used by val/test splits).
+
+        Returns
+        -------
+        a_df : DataFrame
+            Indexed by ``hadm_id``. Columns are ``"<itemid>_B<bin>_<feature>"``.
+        itemids, bins : optional
+            Returned when ``return_itemids_bins=True``.
+        """
+        all_admissions = data["hadm_id"].unique()
+
+        if itemids is not None and bins is not None:
+            all_items = list(itemids)
+            all_bins = list(bins)
+        else:
+            all_items = sorted(data["itemid"].unique())
+            all_bins = sorted(data["bin"].unique())
+
+        # 1) Per-day mean across (admission, itemid, bin), no imputation.
+        #    Reindexing introduces NaN for combinations that were never
+        #    measured — exactly the signal Approach A wants to preserve.
+        daily = (
+            data.groupby(["hadm_id", "itemid", "bin"])["value"]
+                .mean()
+                .reindex(pd.MultiIndex.from_product(
+                    [all_admissions, all_items, all_bins],
+                    names=["hadm_id", "itemid", "bin"],
+                ))
+                .unstack(level="bin")  # rows: (hadm_id, itemid); cols: bin idx
+        )
+
+        n_admissions = len(all_admissions)
+        out_columns: List[str] = []
+        out_arrays: List[np.ndarray] = []
+
+        # 2) For each itemid, build a (n_admissions, bin_size) matrix per
+        #    Approach-A bin and compute the five features in one vectorized
+        #    call — same routine the standalone unit tests cover.
+        for itemid in all_items:
+            try:
+                sub = daily.xs(itemid, level="itemid")
+            except KeyError:
+                sub = pd.DataFrame(
+                    index=all_admissions, columns=daily.columns, dtype=np.float64,
+                )
+            sub = sub.reindex(index=all_admissions)
+
+            for bin_name, day_idx in A_BINS:
+                mat = np.full(
+                    (n_admissions, len(day_idx)), np.nan, dtype=np.float64,
+                )
+                for j, d in enumerate(day_idx):
+                    if d in sub.columns:
+                        mat[:, j] = sub[d].to_numpy(
+                            dtype=np.float64, na_value=np.nan,
+                        )
+                feats = _compute_a_bin_features(mat, len(day_idx))
+                for fname in A_FEATURES:
+                    out_columns.append(f"{itemid}_{bin_name}_{fname}")
+                    out_arrays.append(feats[fname])
+
+        if out_arrays:
+            arr = np.column_stack(out_arrays)
+        else:
+            arr = np.zeros((n_admissions, 0), dtype=np.float64)
+
+        a_df = pd.DataFrame(
+            arr,
+            index=pd.Index(all_admissions, name="hadm_id"),
+            columns=out_columns,
+        )
+
+        # Post-aggregation NaN → 0. The five-feature spec emits NaN for empty
+        # bins and missing observations; downstream models (GAM in particular)
+        # cannot tolerate NaN cells, and median-imputing a column that is
+        # >50 % NaN distorts the signal. Replacing with 0 preserves the
+        # missingness signal in ``observed_fraction`` (always 0 for empty
+        # bins) while giving solvers a clean, finite design matrix.
+        a_df = a_df.fillna(0.0)
+
+        if return_itemids_bins:
+            return a_df, all_items, all_bins
+        return a_df
+
+    def _combine_feature_types(self, x_df: pd.DataFrame, m_df: pd.DataFrame, delta_df: pd.DataFrame,
                              demo: pd.DataFrame, feat_type: str) -> pd.DataFrame:
         """Combine different feature types based on feat_type parameter."""
         if feat_type == "V":
@@ -379,7 +621,7 @@ def getXplus(ids, saved_data_path, target_cohort, feature_threshold=False,
     """Backward compatibility wrapper for time series features."""
     extractor = TimeSeriesExtractor()
     X_df, y_df, subj_ids, hadm_ids = extractor.extract_features(
-        target_cohort, ids, feature_combination_method, ["LAB", "DEMO"], 
+        target_cohort, ids, feature_combination_method, ["LAB", "DEMO"],
         0, feature_threshold, saved_data_path, feat_type=feat_type
     )
     return X_df, y_df, subj_ids.tolist(), hadm_ids.tolist()

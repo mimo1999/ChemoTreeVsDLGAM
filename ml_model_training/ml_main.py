@@ -170,8 +170,8 @@ def main():
     
     parser.add_argument('--dataset', type=str, default='MIMIC_IV', help='Dataset name')
     parser.add_argument('--cohort', type=str, default='mimic_cohort_NF_30_days', help='Target cohort')
-    parser.add_argument('--model_type', type=str, 
-                       choices=['Logistic Regression', 'Random Forest', 'Gradient Boosting', 'Xgboost', 'CatBoost'], 
+    parser.add_argument('--model_type', type=str,
+                       choices=['Logistic Regression', 'Random Forest', 'Gradient Boosting', 'Xgboost', 'CatBoost', 'GAM'],
                        default='Random Forest')
     parser.add_argument('--features', nargs='+', default=['LAB', 'DEMO'], 
                        help='List of feature types (e.g., LAB DEMO)')
@@ -181,8 +181,8 @@ def main():
     parser.add_argument('--grid_search', type=lambda x: bool(int(x)), default=True)
     parser.add_argument('--feature_selection', type=lambda x: bool(int(x)), default=False)
     parser.add_argument('--load_data', type=lambda x: bool(int(x)), default=False)
-    parser.add_argument('--feat_type', type=str, 
-                       choices=["standard","V", "M", "D", "VMD", "VM", "VD", "MD"], 
+    parser.add_argument('--feat_type', type=str,
+                       choices=["standard","V", "M", "D", "VMD", "VM", "VD", "MD", "A"],
                        default="standard")
     parser.add_argument('--agg_interval', type=int, choices=[3, 6, 12, 24], default=24,
                     help='Aggregation interval in hours (e.g., 3, 6, 12, 24)') 
