@@ -18,8 +18,6 @@ It is purely a wrapper module: any downstream model (EBM, GAMINET, GAM, LR,
 ...) can drop this in front of itself and behave consistently.
 """
 
-from __future__ import annotations
-
 import re
 from functools import partial
 from typing import Iterable, List, Optional, Sequence

@@ -10,7 +10,7 @@ import os
 from config.constants import MODEL_PARAMS, BEST_PARAMS, RANDOM_SEED
 from ml_model_training.model_wrappers.gam_wrapper import LogisticGAMClassifier
 from ml_model_training.model_wrappers.gaminet_wrapper import GAMINetWrapperClassifier
-
+from ml_model_training.model_wrappers.ebm_wrapper import EBMClassifier
 
 class MLModelFactory:
     """Factory class to create ML models."""
@@ -22,6 +22,7 @@ class MLModelFactory:
         'xgboost': xgb.XGBClassifier,
         'catboost': CatBoostClassifier,
         'gam': LogisticGAMClassifier,
+        'ebm': EBMClassifier,
         'gaminet': GAMINetWrapperClassifier,
     }
     

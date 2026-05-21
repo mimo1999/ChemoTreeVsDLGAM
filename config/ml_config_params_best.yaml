@@ -110,12 +110,55 @@ CatBoost:
 
 GAM:
   mimic_cohort_NF_30_days:
-    lam: 20.0
+    lam: 30.0
     n_splines: 5
     spline_order: 3
     max_iter: 150
   mimic_cohort_aplasia_45_days:
     lam: 30.0
-    n_splines: 4
+    n_splines: 5
     spline_order: 3
     max_iter: 150
+
+GAMINET:
+  mimic_cohort_NF_30_days:
+    max_features: 500
+    interact_num: 4
+    batch_size: 1024
+    activation_func: "ReLU"
+    reg_clarity: 0.1
+    max_epochs: [60, 100, 60]
+    device: "cuda"
+  mimic_cohort_aplasia_45_days:
+    max_features: 500
+    interact_num: 4
+    batch_size: 1024
+    activation_func: "ReLU"
+    reg_clarity: 0.1
+    max_epochs: [60, 100, 60]
+    device: "cuda"
+
+EBM:
+  mimic_cohort_NF_30_days:
+    max_features: 500
+    max_bins: 128
+    interactions: 6
+    outer_bags: 8
+    max_rounds: 500
+    learning_rate: 0.01
+    smoothing_rounds: 10
+    interaction_smoothing_rounds: 10
+    early_stopping_rounds: 100
+    early_stopping_tolerance: 0.0001
+
+  mimic_cohort_aplasia_45_days:
+    max_features: 500
+    max_bins: 128
+    interactions: 6
+    outer_bags: 8
+    max_rounds: 500
+    learning_rate: 0.01
+    smoothing_rounds: 10
+    interaction_smoothing_rounds: 10
+    early_stopping_rounds: 100
+    early_stopping_tolerance: 0.0001

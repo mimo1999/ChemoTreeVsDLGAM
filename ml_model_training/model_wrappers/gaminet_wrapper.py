@@ -13,9 +13,6 @@ Lightweight defaults
     interact_num=2, batch_size=1024, activation_func="ReLU",
     reg_clarity=0.1, max_epochs=(50, 50, 50), device="cpu"
 """
-
-from __future__ import annotations
-
 from typing import Iterable, Optional, Tuple
 
 import numpy as np
