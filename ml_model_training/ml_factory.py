@@ -8,7 +8,8 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 import os
 from config.constants import MODEL_PARAMS, BEST_PARAMS, RANDOM_SEED
-from ml_model_training.gam_wrapper import LogisticGAMClassifier
+from ml_model_training.model_wrappers.gam_wrapper import LogisticGAMClassifier
+from ml_model_training.model_wrappers.gaminet_wrapper import GAMINetWrapperClassifier
 
 
 class MLModelFactory:
@@ -21,6 +22,7 @@ class MLModelFactory:
         'xgboost': xgb.XGBClassifier,
         'catboost': CatBoostClassifier,
         'gam': LogisticGAMClassifier,
+        'gaminet': GAMINetWrapperClassifier,
     }
     
     @classmethod
@@ -65,7 +67,6 @@ class MLModelFactory:
         
         return model_class(**model_params)
 
-    
     @classmethod
     def _get_catboost_train_dir(cls, results_path: str):
         """Get CatBoost training directory."""

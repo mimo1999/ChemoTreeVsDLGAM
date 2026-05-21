@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 
 from scipy.sparse import csr_matrix as _csr
 from scipy.sparse import csc_matrix as _csc
@@ -26,12 +25,12 @@ for _sp in (_csr, _csc):
 # ---------------------------------------------------------------------
 
 from pygam import LogisticGAM, s, f, l, terms as pt
+from pygam.utils import OptimizationError as _GAMOptimizationError
 
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
+
+from utils.feature_selector import FeatureSelector
 
 
 class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
@@ -62,7 +61,7 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        lam=100.0,
+        lam=40.0,
         n_splines=4,
         spline_order=3,
         max_iter=150,
@@ -136,74 +135,32 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
             Example: ["gender"]
         """
 
-        # -------------------------------------------------------------
-        # Convert to DataFrame
-        # -------------------------------------------------------------
-
-        if isinstance(X, np.ndarray):
-
-            if feature_names is None:
-                feature_names = [f"f{i}" for i in range(X.shape[1])]
-
-            X_df = pd.DataFrame(X, columns=feature_names)
-
-        else:
-            X_df = X.copy()
-
-            if feature_names is None:
-                feature_names = list(X_df.columns)
-
-        self.feature_names_in_ = list(feature_names)
         cat_feature_names = cat_feature_names or []
 
         # -------------------------------------------------------------
-        # Imputation
+        # Feature selection + scaling (MI top-K → StandardScaler)
+        # Delegates to the shared FeatureSelector so the GAM uses the
+        # same picklable, fold-consistent pipeline as EBM / GAMINET.
         # -------------------------------------------------------------
 
-        self.imputer_ = SimpleImputer(strategy="median")
-
-        X_imp = pd.DataFrame(
-            self.imputer_.fit_transform(X_df),
-            columns=feature_names,
+        self.preproc_ = FeatureSelector(
+            score_func="mutual_info_classif",
+            max_features=self.max_features,
+            random_state=self.random_state,
         )
+        X_scaled = self.preproc_.fit_transform(X, y, feature_names=feature_names)
+        self.selected_features_ = self.preproc_.get_selected_features()
+        # Expose input feature names for diagnostics / _transform_X
+        self.feature_names_in_ = list(self.preproc_.inner.feature_names_in_)
 
         # -------------------------------------------------------------
-        # Feature selection
+        # Identify categorical feature indices (post-selection)
         # -------------------------------------------------------------
 
-        k = min(self.max_features, X_imp.shape[1])
-
-        self.selector_ = SelectKBest(
-            score_func=mutual_info_classif,
-            k=k,
-        )
-
-        X_sel = self.selector_.fit_transform(X_imp, y)
-
-        selected_mask = self.selector_.get_support()
-
-        self.selected_features_ = [
-            f for f, keep in zip(feature_names, selected_mask) if keep
+        cat_indices = [
+            idx for idx, fname in enumerate(self.selected_features_)
+            if fname in cat_feature_names
         ]
-
-        # -------------------------------------------------------------
-        # Scaling
-        # -------------------------------------------------------------
-
-        self.scaler_ = StandardScaler()
-
-        X_scaled = self.scaler_.fit_transform(X_sel)
-
-        # -------------------------------------------------------------
-        # Identify categorical feature indices
-        # -------------------------------------------------------------
-
-        cat_indices = []
-
-        for idx, fname in enumerate(self.selected_features_):
-
-            if fname in cat_feature_names:
-                cat_indices.append(idx)
 
         # -------------------------------------------------------------
         # Build GAM terms
@@ -215,10 +172,9 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
         )
 
         print(
-            f"[GAM] Training with "
-            f"{X_scaled.shape[1]} selected features | "
-            f"lam={self.lam} | "
-            f"n_splines={self.n_splines}"
+            f"[GAM] Training with {X_scaled.shape[1]} selected features "
+            f"(top-{self.max_features} by MI) | "
+            f"lam={self.lam} | n_splines={self.n_splines}"
         )
 
         # -------------------------------------------------------------
@@ -244,24 +200,7 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
     def _transform_X(self, X):
 
         check_is_fitted(self, "gam_")
-
-        if isinstance(X, np.ndarray):
-
-            X_df = pd.DataFrame(
-                X,
-                columns=self.feature_names_in_,
-            )
-
-        else:
-            X_df = X.copy()
-
-        X_imp = self.imputer_.transform(X_df)
-
-        X_sel = self.selector_.transform(X_imp)
-
-        X_scaled = self.scaler_.transform(X_sel)
-
-        return X_scaled
+        return self.preproc_.transform(X)
 
     # -----------------------------------------------------------------
     # Predict API
@@ -272,7 +211,8 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
         X_scaled = self._transform_X(X)
 
         pos = self.gam_.predict_proba(X_scaled)
-
+        pos = np.where(np.isfinite(pos), pos, 0.5)
+        pos = np.clip(pos, 1e-6, 1.0 - 1e-6)
         return np.column_stack([1 - pos, pos])
 
     def predict(self, X):

@@ -68,7 +68,7 @@ class MLTrainer:
         X_test_processed = X_test.copy()
         
         # Logistic Regression requires scaling
-        if model_type in ("Logistic Regression", "GAM"):
+        if model_type in ("Logistic Regression"):
             scaler = StandardScaler()
             X_train_processed = scaler.fit_transform(X_train_processed)
             X_test_processed = scaler.transform(X_test_processed)
@@ -203,9 +203,18 @@ class MLTrainer:
     
     def save_model(self, model, fold):
         """Save trained model."""
-        model_path = os.path.join(self.results_path, f'{self.model_type}_model_fold{fold}.joblib')
-        joblib.dump(model, model_path)
-    
+        model_path = os.path.join(
+            self.results_path, f"{self.model_type}_model_fold{fold}.joblib"
+        )
+        try:
+            joblib.dump(model, model_path)
+        except (TypeError, PicklingError, AttributeError) as exc:
+            print(
+                f"[save_model] WARNING: could not joblib-dump "
+                f"{self.model_type} fold {fold}: {type(exc).__name__}: {exc}. "
+                "Continuing without saving the fitted model."
+            )
+
     def save_outputImp(self, labels, prob, logits, importance, features, fold):
         """Save model outputs and feature importance."""
         output_df = pd.DataFrame()
