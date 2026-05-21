@@ -299,6 +299,156 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
             data = data[data["itemid"].isin(selected_features)]
 
         # ------------------------------------------------------------------
+        # Full M-GAM on V — quantile-binarized V matrix + missingness
+        # indicators (and optionally interactions). Top-10 itemids only.
+        # Trains the cutoffs on the *first* call (where itemids/bins are not
+        # passed, i.e. the training fold) and reuses them on val/test calls
+        # via the ``bins`` slot, which we repurpose to carry the cutoffs dict
+        # without needing data_loader signature changes.
+        # ------------------------------------------------------------------
+        if feat_type == "V_MGAM":
+            from feature_processing.mgam_pipeline import (
+                fit_quantile_cutoffs,
+                mgam_binarize,
+            )
+
+            # Build a NaN-preserving V matrix: per-(hadm, item, bin) mean,
+            # reindexed across all admissions x items x bins, no ffill / no
+            # fillna. Empty cells remain NaN so the binarizer can see them.
+            all_admissions = pd.Index(hadm_ids, name="hadm_id")
+            if itemids is not None and bins is not None and isinstance(bins, dict):
+                all_items = list(itemids)
+                all_bins = list(bins.get("__bins__", []))
+                cutoffs = bins.get("__cutoffs__", {})
+            else:
+                all_items = sorted(data["itemid"].unique())
+                all_bins = sorted(data["bin"].unique())
+                cutoffs = None
+
+            x_values = (
+                data.groupby(["hadm_id", "itemid", "bin"])["value"].mean()
+                .reindex(pd.MultiIndex.from_product(
+                    [all_admissions, all_items, all_bins],
+                    names=["hadm_id", "itemid", "bin"],
+                ))
+                .unstack(level="bin")          # rows: (hadm, item), cols: bin
+                .unstack(level="itemid")       # rows: hadm, cols: (bin, item)
+            )
+            # Flatten MultiIndex columns to `<itemid>_<bin>` strings
+            x_values.columns = [f"{itemid}_{b}" for (b, itemid) in x_values.columns]
+            x_values = x_values.reindex(index=all_admissions)
+
+            numerical_cols = list(x_values.columns)
+
+            # Train fold: fit cutoffs. Val/test: reuse passed cutoffs.
+            if cutoffs is None:
+                cutoffs = fit_quantile_cutoffs(
+                    x_values, numerical_cols, quantiles=(0.2, 0.4, 0.6, 0.8),
+                )
+
+            X_mgam = mgam_binarize(
+                x_values,
+                numerical_cols=numerical_cols,
+                cutoffs=cutoffs,
+                specific_mi_intercept=True,
+                overall_mi_intercept=False,
+                specific_mi_ixn=False,
+                overall_mi_ixn=False,
+            )
+
+            # Concatenate demographics. NaN-preserving order matches.
+            demo_aligned = demo.reindex(index=all_admissions)
+            X_df = pd.concat(
+                [X_mgam.reset_index(drop=True), demo_aligned.reset_index(drop=True)],
+                axis=1,
+            )
+
+            if itemids is None and bins is None:
+                # Training: return cutoffs piggy-backed in the bins slot.
+                bins_payload = {"__bins__": all_bins, "__cutoffs__": cutoffs}
+                return (
+                    X_df, y_df,
+                    pd.Series(subject_ids, name="subject_id"),
+                    pd.Series(hadm_ids, name="hadm_id"),
+                    all_items, bins_payload,
+                )
+            return (
+                X_df, y_df,
+                pd.Series(subject_ids, name="subject_id"),
+                pd.Series(hadm_ids, name="hadm_id"),
+            )
+
+        # ------------------------------------------------------------------
+        # Approach AM = Approach A + M-GAM-style missingness indicators on
+        # ``_mean`` columns only. Layers a 300-column binary augmentation on
+        # top of the standard 1500-column feat_type=A representation. The
+        # M-GAM library is not imported — only the missingness-indicator
+        # portion is reimplemented locally in ``feature_processing.mgam_augment``.
+        # ------------------------------------------------------------------
+        if feat_type == "AM":
+            if itemids is None and bins is None:
+                am_df, all_itemids, all_bins = self._compute_am_features(
+                    data, target_cohort, return_itemids_bins=True,
+                )
+            else:
+                am_df = self._compute_am_features(
+                    data, target_cohort, itemids=itemids, bins=bins,
+                )
+
+            am_df = am_df.reindex(hadm_ids)
+            X_df = pd.concat(
+                [am_df.reset_index(drop=True), demo.reset_index(drop=True)],
+                axis=1,
+            )
+
+            if itemids is None and bins is None:
+                return (
+                    X_df, y_df,
+                    pd.Series(subject_ids, name="subject_id"),
+                    pd.Series(hadm_ids, name="hadm_id"),
+                    all_itemids, all_bins,
+                )
+            return (
+                X_df, y_df,
+                pd.Series(subject_ids, name="subject_id"),
+                pd.Series(hadm_ids, name="hadm_id"),
+            )
+
+        # ------------------------------------------------------------------
+        # Approach A+ — refined per-phase set (last_value, robust_trend,
+        # observed_fraction, abnormal_fraction, volatility). Same three
+        # B-bin partition as Approach A; ref ranges fit on train fold.
+        # ------------------------------------------------------------------
+        if feat_type == "A+":
+            if itemids is None and bins is None:
+                ap_df, all_itemids, all_bins = self._compute_a_plus_features(
+                    data, target_cohort, return_itemids_bins=True,
+                )
+            else:
+                ap_df = self._compute_a_plus_features(
+                    data, target_cohort, itemids=itemids, bins=bins,
+                )
+
+            ap_df = ap_df.reindex(hadm_ids)
+            X_df = pd.concat(
+                [ap_df.reset_index(drop=True), demo.reset_index(drop=True)],
+                axis=1,
+            )
+
+            if itemids is None and bins is None:
+                return (
+                    X_df, y_df,
+                    pd.Series(subject_ids, name="subject_id"),
+                    pd.Series(hadm_ids, name="hadm_id"),
+                    all_itemids, all_bins,
+                )
+            return (
+                X_df, y_df,
+                pd.Series(subject_ids, name="subject_id"),
+                pd.Series(hadm_ids, name="hadm_id"),
+            )
+
+        # ------------------------------------------------------------------
         # Approach A short-circuits the V/M/D pipeline: it operates directly
         # on the long-format ``data`` DataFrame *without any imputation* and
         # produces three-bin-aggregated features per (admission, itemid).
@@ -556,6 +706,79 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
         if return_itemids_bins:
             return a_df, all_items, all_bins
         return a_df
+
+    def _compute_am_features(self, data: pd.DataFrame, target_cohort: str,
+                             return_itemids_bins: bool = False,
+                             itemids: list = None, bins: list = None):
+        """Approach AM = Approach A + M-GAM-style missingness indicators.
+
+        Computes the standard ``feat_type=A`` representation (5 features per
+        (itemid, B-bin)), then appends one binary missingness indicator per
+        ``<itemid>_B<n>_mean`` column. The flag is 1 where the original bin
+        had zero observations (i.e. ``<...>_observed_fraction == 0``) and 0
+        otherwise.
+
+        Column-count footprint
+        ----------------------
+        Applying missingness indicators to every A feature would emit
+        ``5 * 100 itemids * 3 bins = 1500`` extra columns. Restricting the
+        augmentation to ``_mean`` columns only emits ``1 * 100 * 3 = 300``
+        — the 5x reduction the design calls for.
+
+        Total dimensionality (top-100 itemids, 14-day window, 3 bins):
+            A features            : 100 itemids x 3 bins x 5 = 1500
+            M-GAM missing flags   : 100 itemids x 3 bins x 1 =  300
+            demographics          :                            +  2
+                                                              ------
+                                                             ~ 1802 cols
+        """
+        from feature_processing.mgam_augment import (
+            add_missingness_indicators,
+            missingness_mask_from_observed_fraction,
+        )
+
+        # 1) Build the standard A representation.
+        if return_itemids_bins:
+            a_df, all_items, all_bins = self._compute_a_features(
+                data,
+                target_cohort,
+                return_itemids_bins=True,
+                fill_missing=False,
+            )
+        else:
+            a_df = self._compute_a_features(
+                data,
+                target_cohort,
+                itemids=itemids,
+                bins=bins,
+                fill_missing=False,
+            )
+
+        # 2) Derive a missingness mask from the A frame's ``_observed_fraction``
+        #    columns and append one 0/1 indicator per ``_mean`` column.
+        miss_mask = missingness_mask_from_observed_fraction(
+            a_df,
+            observed_fraction_suffix="_observed_fraction",
+            target_suffix="_mean",
+        )
+        mean_cols = [c for c in a_df.columns if c.endswith("_mean")]
+        if miss_mask.shape[1] != len(mean_cols):
+            # observed_fraction columns and mean columns must be 1:1
+            raise RuntimeError(
+                f"Mismatch between A's _mean ({len(mean_cols)}) and "
+                f"_observed_fraction ({miss_mask.shape[1]}) column counts"
+            )
+        am_df = add_missingness_indicators(
+            a_df,
+            target_cols=mean_cols,
+            missing_mask=miss_mask,
+            suffix="_missing",
+        )
+        am_df = am_df.fillna(0.0)
+
+        if return_itemids_bins:
+            return am_df, all_items, all_bins
+        return am_df
 
     def _combine_feature_types(self, x_df: pd.DataFrame, m_df: pd.DataFrame, delta_df: pd.DataFrame,
                              demo: pd.DataFrame, feat_type: str) -> pd.DataFrame:

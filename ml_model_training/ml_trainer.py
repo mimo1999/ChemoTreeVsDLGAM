@@ -5,6 +5,7 @@ ML Model Trainer for handling training logic.
 import pandas as pd
 import numpy as np
 import pickle
+from pickle import PicklingError
 import os
 import joblib
 from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold

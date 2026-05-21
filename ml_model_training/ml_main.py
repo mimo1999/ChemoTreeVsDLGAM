@@ -182,7 +182,7 @@ def main():
     parser.add_argument('--feature_selection', type=lambda x: bool(int(x)), default=False)
     parser.add_argument('--load_data', type=lambda x: bool(int(x)), default=False)
     parser.add_argument('--feat_type', type=str,
-                       choices=["standard","V", "M", "D", "VMD", "VM", "VD", "MD", "A"],
+                       choices=["standard","V", "M", "D", "VMD", "VM", "VD", "MD", "A", "AM", "V_MGAM"],
                        default="standard")
     parser.add_argument('--agg_interval', type=int, choices=[3, 6, 12, 24], default=24,
                     help='Aggregation interval in hours (e.g., 3, 6, 12, 24)') 
