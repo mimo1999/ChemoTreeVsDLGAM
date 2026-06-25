@@ -1,4 +1,15 @@
-from typing import Iterable, Optional
+"""
+EBM (Explainable Boosting Machine) wrapper for the ChemoTreeVsDL pipeline.
+
+EBM handles missing values natively via a dedicated missing-value bin per
+feature, so pre-imputing would collapse the missing-value signal into a single
+point. It is also tree-based and invariant to monotone rescaling, so
+StandardScaler provides no benefit.
+
+Feature selection is handled upstream by DataLoader.
+"""
+
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -7,23 +18,20 @@ from sklearn.utils.validation import check_is_fitted
 
 from interpret.glassbox import ExplainableBoostingClassifier
 
-from feature_processing.feature_selector import FeatureSelector
 
-
-class EBMClassifier(BaseEstimator, ClassifierMixin):
-    """EBM wrapped with centralized feature selection + StandardScaler.
+class EBMClassifier(ClassifierMixin, BaseEstimator):
+    """sklearn-compatible wrapper around ExplainableBoostingClassifier.
 
     Parameters
     ----------
-    selector_type : str, default 'mi'
-        Feature selector strategy. One of 'mi', 'tree', 'correlation',
-        'xgb_gain', 'stab_net'. See feature_processing.feature_selector.
-    max_features : int, default 250
-        Top-K selection cap.
     max_bins : int, default 128
+        Histogram bin count per feature.
     interactions : int, default 2
+        Number of pairwise interaction terms added after main effects.
     outer_bags : int, default 4
+        Number of bagged re-fits.
     max_rounds : int, default 100
+        Hard cap on boosting rounds per feature.
     learning_rate : float, default 0.1
     smoothing_rounds : int, default 25
     interaction_smoothing_rounds : int, default 25
@@ -35,8 +43,6 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        selector_type: str = "mi",
-        max_features: int = 250,
         max_bins: int = 128,
         interactions: int = 2,
         outer_bags: int = 4,
@@ -49,8 +55,6 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
         inner_bags: int = 0,
         random_state: int = 42,
     ):
-        self.selector_type = selector_type
-        self.max_features = max_features
         self.max_bins = max_bins
         self.interactions = interactions
         self.outer_bags = outer_bags
@@ -67,20 +71,17 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
         self,
         X,
         y,
-        feature_names: Optional[Iterable[str]] = None,
-        cat_feature_names=None,
+        feature_names: Iterable[str] | None = None,
+        sample_weight=None,
     ):
-        self.preproc_ = FeatureSelector(
-            selector_type=self.selector_type,
-            max_features=self.max_features,
-            random_state=self.random_state,
-        )
-        X_scaled = self.preproc_.fit_transform(X, y, feature_names=feature_names)
-        self.selected_features_ = self.preproc_.get_selected_features()
+        if feature_names is None:
+            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
+        self.selected_features_ = list(feature_names)
+
+        X_arr = X.values if hasattr(X, "values") else np.asarray(X, dtype=float)
 
         print(
-            f"[EBM] Training with {X_scaled.shape[1]} selected features "
-            f"(selector={self.selector_type}) | "
+            f"[EBM] Training with {X_arr.shape[1]} features | "
             f"max_bins={self.max_bins} | interactions={self.interactions} | "
             f"outer_bags={self.outer_bags} | max_rounds={self.max_rounds} | "
             f"lr={self.learning_rate}"
@@ -100,13 +101,13 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
             random_state=self.random_state,
             feature_names=self.selected_features_,
         )
-        self.ebm_.fit(X_scaled, y)
+        self.ebm_.fit(X_arr, y, sample_weight=sample_weight)
         self.classes_ = np.array([0, 1])
         return self
 
     def _transform_X(self, X):
         check_is_fitted(self, "ebm_")
-        return self.preproc_.transform(X)
+        return X.values if hasattr(X, "values") else np.asarray(X, dtype=float)
 
     def predict_proba(self, X):
         return self.ebm_.predict_proba(self._transform_X(X))

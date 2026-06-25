@@ -1,77 +1,53 @@
 """
-Lightweight GAMINET wrapper that mirrors the pattern of
-``ChemoTreeVsDL-main/ml_model_training/gam_wrapper.py``:
+GAMINET wrapper for the ChemoTreeVsDL pipeline.
 
-    SimpleImputer -> SelectKBest(MI, k) -> StandardScaler -> GAMINetClassifier
+Pipeline: MinMax[0,1] -> GAMINetClassifier
 
-Designed for wide, sparse tabular cohorts where the library default
-``max_epochs=(3000, 1000, 1000)`` is prohibitively expensive. Defaults below
-keep training time within minutes per fold.
+MinMax scaling is required because GAMINET's internal binner assumes a finite
+support; heavy-tailed lab features can produce extreme z-scores that NaN-out
+the loss at the first epoch when StandardScaler is used instead.
 
-Lightweight defaults
---------------------
-    interact_num=2, batch_size=1024, activation_func="ReLU",
-    reg_clarity=0.1, max_epochs=(50, 50, 50), device="cpu"
+Feature selection and NaN-filling are handled upstream by DataLoader.
 """
-from typing import Iterable, Optional, Tuple
+
+from collections.abc import Iterable
+from typing import Tuple
 
 import numpy as np
 
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
-# ---------------------------------------------------------------------
-# Compatibility patch for piml + sklearn 1.6+
-# ---------------------------------------------------------------------
-# sklearn 1.6 removed BaseEstimator._validate_data; piml's GAMINetClassifier
-# still calls it. Reinstate it as a thin wrapper around the new functional
-# API so the model fits without monkey-patching at the caller. The import
-# is performed lazily inside the method to avoid any free-variable / stale-
-# bytecode issues with closures captured at module load time.
+# piml's GAMINetClassifier still calls BaseEstimator._validate_data, which was
+# removed in sklearn 1.6. Reinstate it as a thin wrapper around the new API.
 if not hasattr(BaseEstimator, "_validate_data"):
     def _validate_data_compat(self, X="no_validation", y="no_validation", **kwargs):
-        from sklearn.utils.validation import validate_data as _vd  # local import
+        from sklearn.utils.validation import validate_data as _vd
         return _vd(self, X=X, y=y, **kwargs)
 
     BaseEstimator._validate_data = _validate_data_compat  # type: ignore[attr-defined]
 
 from piml.models import GAMINetClassifier
 
-from feature_processing.feature_selector import FeatureSelector
 
-
-class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
-    """GAMINET wrapped with a configurable feature selector + StandardScaler.
+class GAMINetWrapperClassifier(ClassifierMixin, BaseEstimator):
+    """GAMINET wrapped with MinMax [0,1] scaling.
 
     Parameters
     ----------
-    selector_type : str, default ``"mi"``
-        Feature selector strategy. One of 'mi', 'tree', 'correlation',
-        'xgb_gain', 'stab_net', 'recency'.
-        - ``"recency"`` → drop early-phase columns by parsing the temporal
-          index out of the column names (no statistical fit).
-    max_features : int, default 250
-        Top-K selection cap. Ignored when ``selector_type="recency"``.
-    drop_bins, drop_b_bins : sequence of int, optional
-        Forwarded to the recency selector when ``selector_type="recency"``.
-        Defaults to ``(0,1,2,3,4)`` and ``(1,)`` respectively.
     interact_num : int, default 2
         Number of pairwise interaction subnets.
     batch_size : int, default 1024
     activation_func : str, default "ReLU"
     reg_clarity : float, default 0.1
     max_epochs : tuple[int, int, int], default (50, 50, 50)
-        (main-effects, interactions, fine-tune) — each stage is capped here.
+        (main-effects, interactions, fine-tune) epoch caps per stage.
     device : str, default "cpu"
     random_state : int, default 0
     """
 
     def __init__(
         self,
-        selector_type: str = "mi",
-        max_features: int = 250,
-        drop_bins=None,
-        drop_b_bins=None,
         interact_num: int = 2,
         batch_size: int = 1024,
         activation_func: str = "ReLU",
@@ -80,10 +56,6 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
         device: str = "cpu",
         random_state: int = 0,
     ):
-        self.selector_type = selector_type
-        self.max_features = max_features
-        self.drop_bins = drop_bins
-        self.drop_b_bins = drop_b_bins
         self.interact_num = interact_num
         self.batch_size = batch_size
         self.activation_func = activation_func
@@ -92,34 +64,19 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
         self.device = device
         self.random_state = random_state
 
-    # ------------------------------------------------------------------
-    # sklearn API
-    # ------------------------------------------------------------------
-
     def fit(
         self,
         X,
         y,
-        feature_names: Optional[Iterable[str]] = None,
-        cat_feature_names=None,  # accepted for signature parity; unused
+        feature_names: Iterable[str] | None = None,
+        sample_weight=None,
     ):
-        self.preproc_ = FeatureSelector(
-            selector_type=self.selector_type,
-            max_features=self.max_features,
-            random_state=42,
-            drop_bins=self.drop_bins,
-            drop_b_bins=self.drop_b_bins,
-        )
-        X_scaled = self.preproc_.fit_transform(
-            X, y, feature_names=feature_names
-        )
-        self.selected_features_ = self.preproc_.get_selected_features()
+        if feature_names is None:
+            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
+        self.selected_features_ = list(feature_names)
 
-        # GAMINET expects bounded inputs (its internal binner assumes a finite
-        # support). After StandardScaler, heavy-tailed A+ features can produce
-        # extreme values that NaN-out the loss at epoch 1. Apply a min-max
-        # rescale to [0, 1] per column and drop zero-variance columns.
-        X_scaled = np.asarray(X_scaled, dtype=np.float32)
+        X_scaled = np.asarray(X, dtype=np.float32)
+
         col_min = X_scaled.min(axis=0)
         col_max = X_scaled.max(axis=0)
         col_range = col_max - col_min
@@ -132,23 +89,15 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
             col_range = col_range[self._gaminet_keep_mask_]
         self._gaminet_col_min_ = col_min
         self._gaminet_col_range_ = col_range
-        X_scaled = (X_scaled - col_min) / col_range
-        X_scaled = np.clip(X_scaled, 0.0, 1.0).astype(np.float32)
+        X_scaled = np.clip((X_scaled - col_min) / col_range, 0.0, 1.0).astype(np.float32)
 
-        # FeatureSelector returns ndarray for MI and DataFrame for recency;
-        # GAMINET fits on either. Capture the shape consistently for logging.
-        if hasattr(X_scaled, "shape"):
-            n_cols = X_scaled.shape[1]
-        else:
-            n_cols = len(self.selected_features_)
         print(
-            f"[GAMINET] Training with {n_cols} selected features "
-            f"(selector={self.selector_type}) | "
+            f"[GAMINET] Training with {X_scaled.shape[1]} selected features | "
             f"interact_num={self.interact_num} | "
             f"max_epochs={self.max_epochs} | batch_size={self.batch_size}"
         )
 
-        # yaml lists arrive as python lists; piml expects a 3-tuple.
+        # yaml lists arrive as Python lists; piml expects a 3-tuple.
         max_epochs = tuple(self.max_epochs) if not isinstance(self.max_epochs, tuple) else self.max_epochs
 
         self.gaminet_ = GAMINetClassifier(
@@ -162,15 +111,13 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
             device=self.device,
             random_state=self.random_state,
         )
-        self.gaminet_.fit(X_scaled, y)
+        self.gaminet_.fit(X_scaled, y, sample_weight=sample_weight)
         self.classes_ = np.array([0, 1])
         return self
 
     def _transform_X(self, X):
         check_is_fitted(self, "gaminet_")
-        Xt = self.preproc_.transform(X)
-        Xt = np.asarray(Xt, dtype=np.float32)
-        # Apply the same column filter + min-max scaling fit at training time.
+        Xt = np.asarray(X, dtype=np.float32)
         if hasattr(self, "_gaminet_keep_mask_"):
             Xt = Xt[:, self._gaminet_keep_mask_]
         Xt = (Xt - self._gaminet_col_min_) / self._gaminet_col_range_
@@ -178,11 +125,10 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
 
     def predict_proba(self, X):
         proba = np.asarray(self.gaminet_.predict_proba(self._transform_X(X)))
-        # NaN guard — GAMINET can emit NaNs if its fine-tune stage diverged.
+        # GAMINET can emit NaNs if its fine-tune stage diverged.
         if not np.all(np.isfinite(proba)):
             proba = np.nan_to_num(proba, nan=0.5, posinf=1.0, neginf=0.0)
         proba = np.clip(proba, 1e-6, 1.0 - 1e-6)
-        # Some piml versions return 1-D; normalise to 2-D for sklearn parity.
         if proba.ndim == 1:
             proba = np.column_stack([1 - proba, proba])
         return proba
@@ -192,10 +138,6 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
 
     def predict_log_proba(self, X):
         return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     def get_selected_features(self):
         check_is_fitted(self, "gaminet_")
