@@ -37,7 +37,7 @@ if not hasattr(BaseEstimator, "_validate_data"):
 
 from piml.models import GAMINetClassifier
 
-from utils.feature_selector import FeatureSelector
+from feature_processing.feature_selector import FeatureSelector
 
 
 class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
@@ -45,18 +45,16 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
 
     Parameters
     ----------
-    score_func : str or callable, default ``"mutual_info_classif"``
-        Strategy passed to :class:`utils.feature_selector.FeatureSelector`.
-        - ``"mutual_info_classif"`` / ``"mi"`` / sklearn ``mutual_info_classif``
-          → median-impute + ``SelectKBest(MI)`` + StandardScaler.
+    selector_type : str, default ``"mi"``
+        Feature selector strategy. One of 'mi', 'tree', 'correlation',
+        'xgb_gain', 'stab_net', 'recency'.
         - ``"recency"`` → drop early-phase columns by parsing the temporal
           index out of the column names (no statistical fit).
-    max_features : int, default 200
-        Top-K MI selection cap. Ignored when ``score_func="recency"``.
+    max_features : int, default 250
+        Top-K selection cap. Ignored when ``selector_type="recency"``.
     drop_bins, drop_b_bins : sequence of int, optional
-        Forwarded to the recency selector when ``score_func="recency"``.
-        Defaults to ``(0,1,2,3,4)`` and ``(1,)`` respectively (drop the
-        first 5 days for V/M/D/VMD/V_MGAM/standard and B1 for A/AM).
+        Forwarded to the recency selector when ``selector_type="recency"``.
+        Defaults to ``(0,1,2,3,4)`` and ``(1,)`` respectively.
     interact_num : int, default 2
         Number of pairwise interaction subnets.
     batch_size : int, default 1024
@@ -70,8 +68,8 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        score_func="mutual_info_classif",
-        max_features: int = 200,
+        selector_type: str = "mi",
+        max_features: int = 250,
         drop_bins=None,
         drop_b_bins=None,
         interact_num: int = 2,
@@ -82,7 +80,7 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
         device: str = "cpu",
         random_state: int = 0,
     ):
-        self.score_func = score_func
+        self.selector_type = selector_type
         self.max_features = max_features
         self.drop_bins = drop_bins
         self.drop_b_bins = drop_b_bins
@@ -106,7 +104,7 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
         cat_feature_names=None,  # accepted for signature parity; unused
     ):
         self.preproc_ = FeatureSelector(
-            score_func=self.score_func,
+            selector_type=self.selector_type,
             max_features=self.max_features,
             random_state=42,
             drop_bins=self.drop_bins,
@@ -145,7 +143,7 @@ class GAMINetWrapperClassifier(BaseEstimator, ClassifierMixin):
             n_cols = len(self.selected_features_)
         print(
             f"[GAMINET] Training with {n_cols} selected features "
-            f"(mode={self.preproc_.mode}) | "
+            f"(selector={self.selector_type}) | "
             f"interact_num={self.interact_num} | "
             f"max_epochs={self.max_epochs} | batch_size={self.batch_size}"
         )

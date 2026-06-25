@@ -7,24 +7,23 @@ from sklearn.utils.validation import check_is_fitted
 
 from interpret.glassbox import ExplainableBoostingClassifier
 
-from utils.feature_selector import TopKFeatureSelector
+from feature_processing.feature_selector import FeatureSelector
 
 
 class EBMClassifier(BaseEstimator, ClassifierMixin):
-    """EBM wrapped with median-imputation + MI top-K + StandardScaler.
+    """EBM wrapped with centralized feature selection + StandardScaler.
 
     Parameters
     ----------
-    max_features : int, default 200
-        Top-K MI selection cap.
+    selector_type : str, default 'mi'
+        Feature selector strategy. One of 'mi', 'tree', 'correlation',
+        'xgb_gain', 'stab_net'. See feature_processing.feature_selector.
+    max_features : int, default 250
+        Top-K selection cap.
     max_bins : int, default 128
-        EBM histogram bin count per feature.
     interactions : int, default 2
-        Number of pairwise interaction terms to add after the main effects.
     outer_bags : int, default 4
-        Number of bagged re-fits.
     max_rounds : int, default 100
-        Hard cap on boosting rounds per feature.
     learning_rate : float, default 0.1
     smoothing_rounds : int, default 25
     interaction_smoothing_rounds : int, default 25
@@ -36,7 +35,8 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        max_features: int = 300,
+        selector_type: str = "mi",
+        max_features: int = 250,
         max_bins: int = 128,
         interactions: int = 2,
         outer_bags: int = 4,
@@ -49,6 +49,7 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
         inner_bags: int = 0,
         random_state: int = 42,
     ):
+        self.selector_type = selector_type
         self.max_features = max_features
         self.max_bins = max_bins
         self.interactions = interactions
@@ -67,19 +68,19 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
         X,
         y,
         feature_names: Optional[Iterable[str]] = None,
-        cat_feature_names=None,  # accepted for signature parity; unused
+        cat_feature_names=None,
     ):
-        self.preproc_ = TopKFeatureSelector(
+        self.preproc_ = FeatureSelector(
+            selector_type=self.selector_type,
             max_features=self.max_features,
             random_state=self.random_state,
         )
-        X_scaled = self.preproc_.fit_transform(
-            X, y, feature_names=feature_names
-        )
+        X_scaled = self.preproc_.fit_transform(X, y, feature_names=feature_names)
         self.selected_features_ = self.preproc_.get_selected_features()
 
         print(
-            f"[EBM] Training with {X_scaled.shape[1]} selected features | "
+            f"[EBM] Training with {X_scaled.shape[1]} selected features "
+            f"(selector={self.selector_type}) | "
             f"max_bins={self.max_bins} | interactions={self.interactions} | "
             f"outer_bags={self.outer_bags} | max_rounds={self.max_rounds} | "
             f"lr={self.learning_rate}"
@@ -115,10 +116,6 @@ class EBMClassifier(BaseEstimator, ClassifierMixin):
 
     def predict_log_proba(self, X):
         return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     def get_selected_features(self):
         check_is_fitted(self, "ebm_")

@@ -1,0 +1,3 @@
+[submodule "ml_model_training/model_wrappers/nam"]
+	path = ml_model_training/model_wrappers/nam
+	url = https://github.com/AmrMKayid/nam.git

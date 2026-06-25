@@ -30,7 +30,7 @@ from pygam.utils import OptimizationError as _GAMOptimizationError
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
-from utils.feature_selector import FeatureSelector
+from feature_processing.feature_selector import FeatureSelector
 
 
 class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
@@ -65,13 +65,15 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
         n_splines=4,
         spline_order=3,
         max_iter=150,
-        max_features=200,
+        selector_type: str = "mi",
+        max_features=250,
         random_state=42,
     ):
         self.lam = lam
         self.n_splines = n_splines
         self.spline_order = spline_order
         self.max_iter = max_iter
+        self.selector_type = selector_type
         self.max_features = max_features
         self.random_state = random_state
 
@@ -144,13 +146,12 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
         # -------------------------------------------------------------
 
         self.preproc_ = FeatureSelector(
-            score_func="mutual_info_classif",
+            selector_type=self.selector_type,
             max_features=self.max_features,
             random_state=self.random_state,
         )
         X_scaled = self.preproc_.fit_transform(X, y, feature_names=feature_names)
         self.selected_features_ = self.preproc_.get_selected_features()
-        # Expose input feature names for diagnostics / _transform_X
         self.feature_names_in_ = list(self.preproc_.inner.feature_names_in_)
 
         # -------------------------------------------------------------
@@ -173,7 +174,7 @@ class LogisticGAMClassifier(BaseEstimator, ClassifierMixin):
 
         print(
             f"[GAM] Training with {X_scaled.shape[1]} selected features "
-            f"(top-{self.max_features} by MI) | "
+            f"(selector={self.selector_type}, top-{self.max_features}) | "
             f"lam={self.lam} | n_splines={self.n_splines}"
         )
 
