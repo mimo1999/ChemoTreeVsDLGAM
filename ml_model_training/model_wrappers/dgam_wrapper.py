@@ -100,8 +100,8 @@ class DGAMClassifier(ClassifierMixin, BaseEstimator):
     verbose : bool
     """
 
-    _DEMO_SPLINE = ("age", "los", "weight", "height", "bmi")
-    _DEMO_CAT    = ("gender", "sex", "ethnicity", "race")
+    _DEMO_SPLINE = ("age",)
+    _DEMO_CAT    = ("gender",)
 
     def __init__(
         self,

@@ -83,7 +83,7 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
     # from a smooth spline term. Everything else gets a linear term (l),
     # which is cheaper, more stable in PIRLS, and avoids spurious
     # nonlinearities on lab-value features that are effectively linear.
-    _SPLINE_FEATURES = ("age", "los")
+    _SPLINE_FEATURES = ("age")
 
     def _build_terms(self, feature_names, cat_indices):
 
@@ -92,9 +92,11 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
         for i, fname in enumerate(feature_names):
 
             if i in cat_indices:
+                # Categorical: factor (step-function) term only
                 term_list.append(f(i))
 
             elif any(key in fname.lower() for key in self._SPLINE_FEATURES):
+                # Continuous demographic: smooth spline
                 term_list.append(
                     s(
                         i,
@@ -122,6 +124,29 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
         feature_names=None,
         cat_feature_names=None,
     ):
+        """
+        Fit GAM model.
+
+        Parameters
+        ----------
+        X : array-like
+            Feature matrix
+
+        y : array-like
+            Binary labels
+
+        feature_names : list[str]
+            Column names for X
+
+        cat_feature_names : list[str]
+            Names of categorical columns
+            Example: ["gender"]
+        """
+
+        # -------------------------------------------------------------
+        # Convert to DataFrame
+        # -------------------------------------------------------------
+
         if isinstance(X, np.ndarray):
             if feature_names is None:
                 feature_names = [f"f{i}" for i in range(X.shape[1])]
@@ -138,10 +163,18 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
         self.scaler_ = StandardScaler()
         X_scaled = self.scaler_.fit_transform(X_df)
 
+        # -------------------------------------------------------------
+        # Identify categorical feature indices
+        # -------------------------------------------------------------
+
         cat_indices = [
             idx for idx, fname in enumerate(self.selected_features_)
             if fname in cat_feature_names
         ]
+
+        # -------------------------------------------------------------
+        # Build GAM terms
+        # -------------------------------------------------------------
 
         terms = self._build_terms(
             feature_names=self.selected_features_,
@@ -153,9 +186,12 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
             f"lam={self.lam} | n_splines={self.n_splines}"
         )
 
-        # Retry with increasing lam if PIRLS diverges.
+        # -------------------------------------------------------------
+        # Train GAM  (retry with increasing lam if PIRLS diverges)
+        # -------------------------------------------------------------
+
         lam = self.lam
-        _MAX_RETRIES = 2
+        _MAX_RETRIES = 2          # lam grows as: lam * 50^attempt
         fitted = False
         for attempt in range(_MAX_RETRIES):
             self.gam_ = LogisticGAM(
@@ -206,8 +242,9 @@ class LogisticGAMClassifier(ClassifierMixin, BaseEstimator):
     def predict_proba(self, X):
         X_scaled = self._transform_X(X)
         pos = self.gam_.predict_proba(X_scaled)
-        # pygam can return NaN (degenerate coefs) or values outside [0,1]
-        # due to float overflow; np.clip passes NaN through so sanitise first.
+        # pygam can return NaN (PIRLS converged to degenerate coefs) or values
+        # just outside [0, 1] due to float overflow in the link function;
+        # np.clip passes NaN through unchanged so we sanitise first.
         pos = np.where(np.isfinite(pos), pos, 0.5)
         pos = np.clip(pos, 1e-6, 1.0 - 1e-6)
         return np.column_stack([1 - pos, pos])
