@@ -23,9 +23,9 @@ Logistic Regression:
     max_iter: 2000
 
   grid_search:
-    max_iter: [2000]
+    max_iter: [1000, 1500]
     C: [0.01, 0.1, 1]
-    penalty: [l2]
+    penalty: [l1, l2]
     class_weight:
       - null
       - {0: 1, 1: 2}
@@ -74,26 +74,57 @@ CatBoost:
     n_estimators: 300
 
   grid_search:
-    learning_rate: [0.03, 0.1]
+    learning_rate: [0.1]
     depth: [4, 6, 8]
     n_estimators: [200, 300, 500]
 
 GAM:
   default:
-    lam: 30.0
-    n_splines: 4
+    lam: 20
+    n_splines: 5
     spline_order: 3
-    max_iter: 200
+    max_iter: 150
 
   grid_search:
-    lam: [10.0, 20.0, 40.0]
-    n_splines: [4, 6]
+    lam: [10, 20, 50, 100]
+    n_splines: [4, 5, 6]      # all valid: n_splines > spline_order=3 required
     spline_order: [3]
     max_iter: [150]
 
+EBM:
+  # Best config validated on k=250, noOS, VMD, tree-FS (AUROC=0.822, 2026-06-25)
+  default:
+    max_bins: 128
+    interactions: 3
+    outer_bags: 4
+    max_rounds: 100
+    learning_rate: 0.05
+    smoothing_rounds: 25
+    interaction_smoothing_rounds: 25
+    early_stopping_rounds: 30
+    early_stopping_tolerance: 0.0001
+
+  # Grid: 2x2x2 = 8 combinations (interactions x outer_bags x max_rounds).
+  # lr=0.015 fixed (class_weight experiments showed 0.015+max_rounds=1000 >> 0.05+max_rounds=100).
+  # outer_bags=[8,14]: old grid locked at 4; library default 8-16 reduces variance at k=500.
+  # max_rounds=[500,1000] with early_stopping_rounds=100: oversampling no longer inflates
+  #   internal val loss, so early stopping triggers later and needs a higher ceiling.
+  # CHANGED (2026-06-21): k=500 sweep, no-oversampling + balanced sample_weight EBM path.
+  #   Previous grid (interactions=[2,4], outer_bags=4, max_rounds=[50,100], lr=[0.05,0.1])
+  #   was tuned under minority oversampling which corrupted EBM's outer_bags val splits.
+  grid_search:
+    max_bins: [128]
+    interactions: [4, 6]
+    outer_bags: [8, 14]
+    max_rounds: [500, 1000]
+    learning_rate: [0.015]
+    smoothing_rounds: [25]
+    interaction_smoothing_rounds: [25]
+    early_stopping_rounds: [100]
+    early_stopping_tolerance: [0.0001]
+
 GAMINET:
   default:
-    max_features: 500
     interact_num: 2
     batch_size: 1024
     activation_func: "ReLU"
@@ -101,37 +132,118 @@ GAMINET:
     max_epochs: [50, 50, 50]
     device: "cuda"
 
+  # Grid: 3x2x1x3x1 = 18 combinations (interact_num x batch_size x activation x reg_clarity x max_epochs)
+  # CHANGED (2026-06-21): activation locked to ReLU (won all 5 folds); max_epochs fixed to [50,150,100]
+  #   (interaction stage extended to 150 so 8-10 pairwise terms have room to converge;
+  #    fine-tune extended to 100); interact_num pushed to 10 (50-feature space has 1225 pairs,
+  #    previous ceiling of 6 likely underfit); batch_size 512 added (more gradient steps/epoch
+  #    on 4.8% minority class); reg_clarity expanded to [0.05,0.1,0.2] around the winning 0.1.
   grid_search:
-    max_features: [300, 500]
-    interact_num: [2, 5]
-    batch_size: [1024]
+    interact_num: [6, 8, 10]
+    batch_size: [512, 1024]
     activation_func: ["ReLU"]
-    reg_clarity: [0.1]
-    max_epochs: [[50, 50, 50]]
+    reg_clarity: [0.05, 0.1, 0.2]
+    max_epochs: [[50, 150, 100]]
     device: ["cuda"]
 
-
-EBM:
+IGANN:
   default:
-    max_features: 500
-    max_bins: 128
-    interactions: 6
-    outer_bags: 8
-    max_rounds: 500
-    learning_rate: 0.01
-    smoothing_rounds: 10
-    interaction_smoothing_rounds: 10
-    early_stopping_rounds: 100
-    early_stopping_tolerance: 0.0001
+    n_estimators: 500
+    boost_rate: 0.1
+    elm_scale: 1.0
+    elm_alpha: 0.75
+    n_hid: 10
+    init_reg: 1.0
+    act: "elu"
+    early_stopping: 200
+    device: "cpu"
+    verbose: 0
+    random_state: 42
 
   grid_search:
-    max_features: [300, 500]
-    max_bins: [128]
-    interactions: [3, 6]
-    outer_bags: [4, 8]
-    max_rounds: [200, 500]
-    learning_rate: [0.05, 0.1]
-    smoothing_rounds: [10, 25]
-    interaction_smoothing_rounds: [10, 25]
-    early_stopping_rounds: [30]
-    early_stopping_tolerance: [0.0001]
+    n_estimators: [5000]
+    boost_rate: [0.05, 0.1]
+    elm_scale: [1.0]
+    elm_alpha: [0.5, 1.0]
+    n_hid: [50, 100]
+    init_reg: [1.0]
+    act: ["elu"]
+    early_stopping: [200]
+    device: ["cpu"]
+    verbose: [0]
+    random_state: [42]
+
+NAM:
+  default:
+    num_basis_functions: 64      # paper uses 1000 for ~10 features; 64 for 200-feature wide setting
+    hidden_sizes: []
+    dropout: 0.1
+    feature_dropout: 0.0
+    output_regularization: 0.05
+    l2_regularization: 0.0       # ExU weights init at 4.0; L2 would collapse them — use 0.0
+    lr: 0.01
+    num_epochs: 100
+    batch_size: 2048
+    early_stopping_patience: 20
+    val_fraction: 0.15
+    device: "cpu"
+    random_state: 42
+    verbose: 1
+
+  grid_search:
+    num_basis_functions: [32, 64, 128]
+    hidden_sizes: [[]]
+    dropout: [0.0, 0.1, 0.2]
+    feature_dropout: [0.0, 0.1]
+    output_regularization: [0.0, 0.05, 0.1]
+    l2_regularization: [0.0, 0.05, 0.1]
+    lr: [0.005, 0.01, 0.05]
+    num_epochs: [100]
+    batch_size: [1024]
+    early_stopping_patience: [20]
+    val_fraction: [0.15]
+    device: ["cuda"]
+    random_state: [42]
+    verbose: [0]
+
+DGAM:                          # distributed-lag GAM (mgcv backend)
+  default:
+    dl_nonlinear: false
+    k_lag: 4
+    k_val: 5
+    include_missingness: false   # hurts AUROC and ~4x slower on MIMIC
+    value_spline: false          # scalar s(mean value) collinear w/ DL term — hurts
+    max_labs: 40
+    min_lags: 3
+    linear_fallback: false       # off: avoids overfitting from raw linear terms
+    method: fREML
+    random_state: 42
+
+  grid_search:
+    dl_nonlinear: [false]
+    k_lag: [4, 5]
+    k_val: [5]
+    include_missingness: [false]
+    value_spline: [false]
+    max_labs: [30, 40]
+    min_lags: [3]
+    linear_fallback: [false]
+    method: [fREML]
+    random_state: [42]
+
+MGAM:
+  # M-GAM with VMD features: VD as continuous base, M as missingness intercepts,
+  # M_{i,b_miss} x V_{i,b_obs} / D_{i,b_obs} cross-bin interactions per itemid.
+  # Requires feat_type=VMD (or VM/VD/MD subsets).
+  # Backend: fastsparsegams L0-penalized logistic regression on continuous features.
+  # max_support_size controls sparsity (analogous to 1/C in LR).
+  default:
+    max_support_size: 40
+    num_lambda: 50
+    algorithm: CD
+    val_fraction: 0.15
+    max_iter: 200
+    random_state: 42
+
+  grid_search:
+    max_support_size: [20, 40, 80, 150]

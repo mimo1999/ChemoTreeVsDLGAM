@@ -18,7 +18,7 @@ Gradient Boosting:
 
 Logistic Regression:
   mimic_cohort_NF_30_days:
-    C: 0.01
+    C: 0.1
     penalty: l2
     class_weight: null
     max_iter: 2000
@@ -110,55 +110,126 @@ CatBoost:
 
 GAM:
   mimic_cohort_NF_30_days:
-    lam: 30.0
+    lam: 20.0
     n_splines: 5
     spline_order: 3
-    max_iter: 150
   mimic_cohort_aplasia_45_days:
-    lam: 30.0
+    lam: 20.0
     n_splines: 5
     spline_order: 3
-    max_iter: 150
-
-GAMINET:
-  mimic_cohort_NF_30_days:
-    max_features: 500
-    interact_num: 4
-    batch_size: 1024
-    activation_func: "ReLU"
-    reg_clarity: 0.1
-    max_epochs: [60, 100, 60]
-    device: "cuda"
-  mimic_cohort_aplasia_45_days:
-    max_features: 500
-    interact_num: 4
-    batch_size: 1024
-    activation_func: "ReLU"
-    reg_clarity: 0.1
-    max_epochs: [60, 100, 60]
-    device: "cuda"
 
 EBM:
+  # Best params found by grid search (2026-06-21):
+  #   feat_type=VMD, top_k=500, no-oversampling + balanced sample_weight, mimic_cohort_NF_30_days
+  #   Grid: interactions=[4,6] x outer_bags=[8,14] x max_rounds=[500,1000] x lr=0.015
+  #   Result: ROC=0.820 (+0.048 vs old best), Recall=0.681
+  #   interactions=4 selected 3/5 folds; outer_bags=14 selected 3/5; max_rounds=500 selected 4/5
+  #   IMPORTANT: these params assume --oversampling none + balanced sample_weight (auto-applied
+  #   by ml_main.py patch when oversampling != minority). Old oversampling-era params were
+  #   outer_bags=4, max_rounds=50, lr=0.05 — those are invalid under the new training regime.
   mimic_cohort_NF_30_days:
-    max_features: 500
     max_bins: 128
-    interactions: 6
-    outer_bags: 8
+    interactions: 4
+    outer_bags: 14
     max_rounds: 500
-    learning_rate: 0.01
-    smoothing_rounds: 10
-    interaction_smoothing_rounds: 10
+    learning_rate: 0.015
+    smoothing_rounds: 25
+    interaction_smoothing_rounds: 25
     early_stopping_rounds: 100
     early_stopping_tolerance: 0.0001
 
   mimic_cohort_aplasia_45_days:
-    max_features: 500
     max_bins: 128
-    interactions: 6
-    outer_bags: 8
-    max_rounds: 500
-    learning_rate: 0.01
-    smoothing_rounds: 10
-    interaction_smoothing_rounds: 10
-    early_stopping_rounds: 100
+    interactions: 3
+    outer_bags: 4
+    max_rounds: 100
+    learning_rate: 0.05
+    smoothing_rounds: 25
+    interaction_smoothing_rounds: 25
+    early_stopping_rounds: 30
     early_stopping_tolerance: 0.0001
+
+GAMINET:
+  # Best params found by grid search (2026-06-03):
+  #   feat_type=VMD, Stage1 k=100, tree col k=50, mimic_cohort_NF_30_days
+  #   Grid: interact_num=[2,4,6] x activation=[ReLU,GeLU] x reg_clarity=[0.01,0.1] x max_epochs=[[100,100,100],[50,100,50]]
+  #   Result: ROC=0.802, Recall=0.694. ReLU + max_epochs=[50,100,50] selected in all 5 folds.
+  #   interact_num and reg_clarity unstable across folds — set to modal values (6, 0.1).
+  mimic_cohort_NF_30_days:
+    interact_num: 6
+    batch_size: 1024
+    activation_func: "ReLU"
+    reg_clarity: 0.1
+    max_epochs: [50, 100, 50]
+    device: "cuda"
+  mimic_cohort_aplasia_45_days:
+    interact_num: 4
+    batch_size: 1024
+    activation_func: "ReLU"
+    reg_clarity: 0.1
+    max_epochs: [60, 100, 60]
+    device: "cuda"
+
+IGANN:
+  # Params tuned for mimic_cohort_NF_30_days, VMD feat_type, oversampling=minority.
+  # val_set (pre-concat outer val fold, natural 4.85% positive rate) is passed by
+  # ml_main.py for early stopping so boosting convergence is judged on the real
+  # distribution rather than the 50/50 oversampled training split.
+  # Key changes vs defaults: n_hid 10→50, early_stopping 50→200, elm_alpha 1.0→0.5,
+  # device cpu (IGANN ELM ops are CPU-bound; GPU transfer overhead dominates for
+  # ≤150 features on this dataset), random_state aligned to pipeline RANDOM_SEED.
+  mimic_cohort_NF_30_days:
+    n_estimators: 150
+    boost_rate: 0.1
+    elm_scale: 1.0
+    elm_alpha: 1.0
+    n_hid: 10
+    init_reg: 1.0
+    act: "elu"
+    early_stopping: 100
+    device: "cpu"
+    verbose: 0
+    random_state: 42
+
+NAM:
+  mimic_cohort_NF_30_days:
+    num_basis_functions: 64
+    hidden_sizes: [64]
+    dropout: 0.1
+    feature_dropout: 0.05
+    output_regularization: 0.05
+    l2_regularization: 0.0
+    lr: 0.005
+    num_epochs: 200
+    batch_size: 1024
+    early_stopping_patience: 30
+    val_fraction: 0.15
+    device: "cuda"
+    random_state: 42
+    verbose: 1
+
+DGAM:                          # distributed-lag GAM (mgcv backend)
+  mimic_cohort_NF_30_days:
+    dl_nonlinear: false        # s(Lag, by=Value) signal regression
+    k_lag: 4                   # basis dim over the lag (days-before-discharge) axis
+    k_val: 5                   # basis dim over value axis (only if dl_nonlinear)
+    include_missingness: false # missingness DL term hurts AUROC & ~4x slower
+    value_spline: false        # scalar s(mean value) collinear w/ DL term — hurts
+    max_labs: 40               # DL terms (ranked by |corr| of lab mean with y)
+    min_lags: 3                # min bins for a lab to earn a DL term
+    linear_fallback: false     # drop non-DL labs (raw linear terms overfit)
+    method: fREML
+    random_state: 42
+    verbose: 1
+  mimic_cohort_aplasia_45_days:
+    dl_nonlinear: false
+    k_lag: 4
+    k_val: 5
+    include_missingness: false
+    value_spline: false
+    max_labs: 40
+    min_lags: 3
+    linear_fallback: false
+    method: fREML
+    random_state: 42
+    verbose: 1
