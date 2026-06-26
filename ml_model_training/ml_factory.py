@@ -22,11 +22,12 @@ _LAZY_WRAPPERS = {
     'ebm':     ('ml_model_training.model_wrappers.ebm_wrapper',     'EBMClassifier'),
     'gaminet': ('ml_model_training.model_wrappers.gaminet_wrapper', 'GAMINetWrapperClassifier'),
     'igann':   ('ml_model_training.model_wrappers.igann_wrapper',   'IGANNWrapperClassifier'),
+    'nam':     ('ml_model_training.model_wrappers.nam_wrapper',     'NAMWrapperClassifier'),
     'mgam':    ('ml_model_training.model_wrappers.mgam_wrapper',    'MGAMClassifier'),
 }
 
 # Models whose random_state is handled internally by their wrapper.
-_WRAPPER_MODELS = frozenset(['gam', 'ebm', 'gaminet', 'igann', 'mgam'])
+_WRAPPER_MODELS = frozenset(['gam', 'ebm', 'gaminet', 'igann', 'nam', 'mgam'])
 
 
 def _load_wrapper(key: str):
