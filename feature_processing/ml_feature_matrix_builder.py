@@ -292,11 +292,29 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
         labels = pd.read_csv(f'{saved_data_path}/processed_admission_features_csv/{target_cohort}/agg_interval_{agg_interval}h/labels.csv', header=0)
         y_df = labels.set_index("hadm_id").loc[hadm_ids, "label"].reset_index(drop=True)
 
-        if feature_threshold:
+        if feature_threshold and feat_type != "AGG":
             cc_top_features = pd.read_csv(f"{saved_data_path}/top_features/feat_imp_summary.csv")
             selected_features = cc_top_features.itemid.head(100)
-            #print("Feature selection applied (Top 100 features in cancer chemo cohort), Threshold:", len(selected_features))
             data = data[data["itemid"].isin(selected_features)]
+
+        # Lookback window — restrict to the last N bins before discharge.
+        # Applied after Stage 1 (if active) and before any feature computation
+        # so all feature types (VMD, A, AGG, …) benefit automatically.
+        # On train splits (itemids/bins=None) the filtered bin set is
+        # discovered and returned; val/test splits reuse those same bins.
+        lookback_days = kwargs.get('lookback_days', None)
+        early_data = None
+        # lookback window disabled — use all bins
+        # if lookback_days is not None and lookback_days > 0:
+        #     all_available_bins = sorted(data["bin"].unique())
+        #     lookback_bins = set(all_available_bins[-lookback_days:])
+        #     early_bins = set(all_available_bins) - lookback_bins
+        #     if early_bins:
+        #         early_data = data[data["bin"].isin(early_bins)].copy()
+        #     data = data[data["bin"].isin(lookback_bins)]
+        #     print(f"[lookback] Restricting to last {lookback_days} bins: {sorted(lookback_bins)}")
+        #     if early_data is not None and not early_data.empty:
+        #         print(f"[lookback] Early-phase aggregate over bins: {sorted(early_bins)}")
 
         # ------------------------------------------------------------------
         # Full M-GAM on V — quantile-binarized V matrix + missingness
