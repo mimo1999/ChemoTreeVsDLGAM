@@ -1,22 +1,18 @@
-"""Shared R-subprocess utilities for mgcv-backed GAM wrappers."""
+"""R-subprocess utilities for mgcv-backed GAM wrappers.
+
+VMD column-name parsing lives in utils/feature_naming.py (parse_vmd_column);
+`san` is re-exported here for backward compatibility, since R-backed
+wrappers import it from this module.
+"""
 
 import functools
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-# VMD feature-name patterns shared across all R-backed wrappers.
-RE_X = re.compile(r"^[Xx]_(.+)_(\d+)$")   # value    X_<itemid>_<bin>
-RE_M = re.compile(r"^[Mm]_(.+)_(\d+)$")   # missing  M_<itemid>_<bin>
-RE_D = re.compile(r"^[Dd]_(.+)_(\d+)$")   # delta    D_<itemid>_<bin>
-
-
-def san(name: str) -> str:
-    """Sanitise a feature name into a safe R identifier fragment."""
-    return re.sub(r"[^A-Za-z0-9]", "_", str(name))
+from utils.feature_naming import san
 
 
 @functools.lru_cache(maxsize=1)
@@ -65,10 +61,17 @@ def find_rscript() -> str:
     )
 
 
+# Prepended to every generated script so R packages installed into the user
+# library (not the system library under Program Files, which is typically
+# read-only) are found regardless of which account/session runs Rscript.
+LIBPATH_HEADER = '.libPaths(c(Sys.getenv("R_LIBS_USER"), .libPaths()))\n'
+
+
 def run_r(script: str, timeout: int = 1200) -> str:
     """Execute an R script string via Rscript; return combined stdout + stderr."""
     rscript = find_rscript()
     tmp = tempfile.NamedTemporaryFile(suffix=".R", delete=False, mode="w", encoding="utf-8")
+    tmp.write(LIBPATH_HEADER)
     tmp.write(script)
     tmp.close()
     proc = subprocess.run(
