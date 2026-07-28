@@ -119,26 +119,12 @@ GAM:
     spline_order: 3
 
 HE-EBM:
-  # Combiner: all 5 experts trained; a non-negative logistic combiner
-  #   fit on honest OOF logits learns per-expert weights.
-  #   Expert EBM hyperparameters are NOT configured here — HEEBMClassifier._ebm_params()
-  #   always pulls BEST_PARAMS['EBM'][cohort] directly (same tuned backbone as the
-  #   production flat EBM), so there is nothing to duplicate/drift here.
   mimic_cohort_NF_30_days:
     top_k_per_expert: 150
     cv_folds: 5
     combiner_l2: 0.01
 
 EBM:
-  # Best params found by grid search (2026-06-21), interactions updated 2026-06-30:
-  #   feat_type=VMD, top_k=500, no-oversampling + balanced sample_weight, mimic_cohort_NF_30_days
-  #   Grid: interactions=[4,6] x outer_bags=[8,14] x max_rounds=[500,1000] x lr=0.015
-  #   Result: ROC=0.826 (top_k=500), 0.8229 (top_k=250)
-  #   interactions updated 4->2: sweep (interactions=[2,4], top_k=250, VMD) showed interactions=2
-  #   matches interactions=4 on AUC-ROC (0.8229 vs 0.8224) with lower loss and better calibration.
-  #   IMPORTANT: these params assume --oversampling none + balanced sample_weight (auto-applied
-  #   by ml_main.py patch when oversampling != minority). Old oversampling-era params were
-  #   outer_bags=4, max_rounds=50, lr=0.05 — those are invalid under the new training regime.
   mimic_cohort_NF_30_days:
     max_bins: 128
     interactions: 2
@@ -162,20 +148,13 @@ EBM:
     early_stopping_tolerance: 0.0001
 
 GAMINET:
-  # Best params found by grid search (2026-06-03):
-  #   feat_type=VMD, Stage1 k=100, tree col k=50, mimic_cohort_NF_30_days
-  #   Grid: interact_num=[2,4,6] x activation=[ReLU,GeLU] x reg_clarity=[0.01,0.1] x max_epochs=[[100,100,100],[50,100,50]]
-  #   Result: ROC=0.802, Recall=0.694. ReLU + max_epochs=[50,100,50] selected in all 5 folds.
-  #   interact_num and reg_clarity unstable across folds — set to modal values (6, 0.1).
   mimic_cohort_NF_30_days:
     interact_num: 6
     batch_size: 1024
     activation_func: "ReLU"
     reg_clarity: 0.1
     max_epochs: [50, 100, 50]
-    device: "cpu"  # forced from dev's "cuda": this machine has no GPU
-                   # (torch.cuda.is_available() == False) — every other
-                   # tuned hyperparameter above is unchanged from dev.
+    device: "cpu"
   mimic_cohort_aplasia_45_days:
     interact_num: 4
     batch_size: 1024
@@ -185,13 +164,6 @@ GAMINET:
     device: "cuda"
 
 IGANN:
-  # Params tuned for mimic_cohort_NF_30_days, VMD feat_type, oversampling=minority.
-  # val_set (pre-concat outer val fold, natural 4.85% positive rate) is passed by
-  # ml_main.py for early stopping so boosting convergence is judged on the real
-  # distribution rather than the 50/50 oversampled training split.
-  # Key changes vs defaults: n_hid 10→50, early_stopping 50→200, elm_alpha 1.0→0.5,
-  # device cpu (IGANN ELM ops are CPU-bound; GPU transfer overhead dominates for
-  # ≤150 features on this dataset), random_state aligned to pipeline RANDOM_SEED.
   mimic_cohort_NF_30_days:
     n_estimators: 150
     boost_rate: 0.1
@@ -222,7 +194,7 @@ NAM:
     random_state: 42
     verbose: 1
 
-MGAM:                          # Missingness-aware GAM
+MGAM:
   mimic_cohort_NF_30_days:
     max_support_size: 40
     num_lambda: 50
@@ -238,20 +210,13 @@ MGAM:                          # Missingness-aware GAM
     max_iter: 200
     random_state: 42
 
-DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam::mvgam()
-  # Locked-in default (2026-07-27) — see model_params.yaml's DGAM comment for
-  # the full wall-clock/quality sweep this was chosen from (5-fold real MIMIC
-  # data, top-250 tree-selected VM features, mimic_cohort_NF_30_days): 12m16s
-  # for all 5 folds, AUC-ROC 0.7444 +/- 0.0411, matching a slower/larger config
-  # (max_labs=5/burnin=100 -> 19m49s, AUC-ROC 0.7510+/-0.0430) within noise
-  # while beating a more aggressive one (max_labs=3/burnin=50 -> 10m5s,
-  # AUC-ROC 0.7134+/-0.0242, a real quality regression, not noise).
+DGAM:
   mimic_cohort_NF_30_days:
-    k_lag: 3                   # basis dim over the lag (days-before-discharge) axis
-    k_val: 3                   # basis dim over value axis
-    max_labs: 4                 # DL terms (ranked by |corr| of lab mean with y)
-    min_lags: 3                # min bins for a lab to earn a DL term
-    trend_model: "None"        # cross-sectional rows, not a shared time series
+    k_lag: 3
+    k_val: 3
+    max_labs: 4
+    min_lags: 3
+    trend_model: "None"
     family: bernoulli
     backend: cmdstanr
     chains: 2
@@ -263,9 +228,6 @@ DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam
     verbose: 1
     timeout: 450
   mimic_cohort_aplasia_45_days:
-    # Carried over from mimic_cohort_NF_30_days's tuned settings, not
-    # independently validated on this cohort's data — revisit if aplasia's
-    # AUC-ROC/timing looks off.
     k_lag: 3
     k_val: 3
     max_labs: 4
@@ -282,40 +244,14 @@ DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam
     verbose: 1
     timeout: 450
 
-SSTGAM:                        # Shared-Shape Temporal GAM (sstgam package).
-                               # See model_params.yaml's SSTGAM comment for architecture.
+SSTGAM:
   mimic_cohort_NF_30_days:
-    # SWITCHED boost(spline) -> tree (2026-07-23): this exact selector/top_k
-    # protocol (tree selector, top_k=250, lookback=3) was directly A/B tested
-    # in the sstgam_simplified investigation -- tree/adaptive (0.8201-0.8208
-    # 5-fold AUC-ROC) is equal-or-better than spline (0.8198-0.8200) and is
-    # the standing-best config from the whole SSTGAM investigation.
-    # FIXED 2026-07-25: this block had drifted to fit_method: spline (left
-    # over from a one-off benchmark10_sstgam_spline toggle that was never
-    # reverted) with an incomplete schedule (no max_rounds/
-    # early_stopping_rounds -- silently fell back to the library's tree-sized
-    # defaults, 100/15, instead of spline's own tuned 300/30). Reverted to
-    # fit_method: tree (the actual standing-best config per the comment
-    # above) with the full schedule specified explicitly, matching
-    # Clean_pipeline's and ChemoTreeVsDL-main's SSTGAM.mimic_cohort_NF_30_days
-    # blocks. Also renamed for the sstgam package rewrite: max_depth ->
-    # tree_depth; day_split_depth/smoothing_rounds/outer_bags/max_labs
-    # REMOVED (no longer accepted by the constructor -- see
-    # sstgam/tree_boost.py, sstgam/_base.py).
-    # RETUNED 2026-07-25: grid search (n_value_bins x tree_depth x
-    # learning_rate, lookback=3/top_k=250, Clean_pipeline) found
-    # n_value_bins=8/tree_depth=2 beats 16/3 by +0.30pp AUC-ROC (0.8258 vs
-    # 0.8228) -- shallower trees generalize better now that there's no
-    # bagging/adaptive-split to control overfitting. Bin count is
-    # lookback-dependent (32 won at lookback=15); this stays tuned for the
-    # production lookback=3 window.
-    fit_method: tree
-    n_value_bins: 8
-    tree_depth: 2
+    fit_method: boost
+    n_value_bases: 8
     learning_rate: 0.02
-    max_rounds: 100
-    early_stopping_rounds: 15
+    max_rounds: 300
+    early_stopping_rounds: 30
+    outer_bags: 4
     val_fraction: 0.15
     random_state: 42
     verbose: 1
-

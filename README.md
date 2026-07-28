@@ -41,7 +41,6 @@ All of the following are trained via `ml_model_training/ml_main.py --model_type 
 ## Cohorts
 
 - Patients with a cancer diagnosis and at least one chemotherapy procedure.  
-- **Aplasia:** defined by transfusion procedures or low absolute neutrophil count.  
 - **Neutropenic fever:** concurrent neutropenia and fever diagnoses.  
 - **Prediction target:** onset of the condition within the prediction window (45 days after discharge for aplasia, 30 days for neutropenic fever) and before the next chemotherapy cycle.  
 - **Observation window:** 14 days prior to discharge.  

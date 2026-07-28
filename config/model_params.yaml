@@ -11,9 +11,6 @@ Gradient Boosting:
     learning_rate: [0.01, 0.05, 0.1]
     max_iter: [100, 200]
     max_depth: [null, 5, 10]
-    #class_weight:
-    #  - null
-    #  - {0: 1, 1: 2}
 
 Logistic Regression:
   default:
@@ -63,7 +60,6 @@ Xgboost:
     n_estimators: [100, 150, 200]
     scale_pos_weight: [1, 2]
     objective: [binary:logistic]
-    #eval_metric: logloss
 
 CatBoost:
   default:
@@ -85,31 +81,21 @@ GAM:
 
   grid_search:
     lam: [10, 20, 50, 100]
-    n_splines: [4, 5, 6]      # all valid: n_splines > spline_order=3 required
+    n_splines: [4, 5, 6]
     spline_order: [3]
     max_iter: [150]
 
 HE-EBM:
   default:
-    # No EBM hyperparameters here — HE-EBM always pulls its expert EBM backbone
-    # from BEST_PARAMS['EBM'][cohort] (raises if that cohort isn't tuned yet).
-    # Intra-group feature selection:
-    top_k_per_expert: 150      # RF top-K within each expert's feature group
-    # Combiner: all experts trained; a non-negative logistic combiner fit on
-    # honest OOF logits learns per-expert weights (no hand-excluded experts).
-    cv_folds: 5                # OOF cross-fit folds for combiner + bagged inference
-    combiner_l2: 0.01          # L2 on the non-negative expert weights
+    top_k_per_expert: 150
+    cv_folds: 5
+    combiner_l2: 0.01
 
   grid_search:
     top_k_per_expert: [100, 150, 250]
     combiner_l2: [0.001, 0.01, 0.1]
 
 IG-EBM:
-  # EBM with forced same-itemid cross-day-bin interaction pairs instead of
-  # FAST auto-search. Backbone hyperparameters below are only a fallback:
-  # IGEBMClassifier._resolve_backbone_params() pulls BEST_PARAMS['EBM'][cohort]
-  # at fit time whenever that cohort has been tuned, so these normally mirror
-  # the flat EBM's own default block and are never actually used.
   default:
     max_bins: 128
     outer_bags: 4
@@ -131,7 +117,6 @@ IG-EBM:
     early_stopping_tolerance: [0.0001]
 
 EBM:
-  # Best config validated on k=250, noOS, VMD, tree-FS (AUROC=0.822, 2026-06-25)
   default:
     max_bins: 128
     interactions: 3
@@ -143,14 +128,6 @@ EBM:
     early_stopping_rounds: 30
     early_stopping_tolerance: 0.0001
 
-  # Grid: 2x2x2 = 8 combinations (interactions x outer_bags x max_rounds).
-  # lr=0.015 fixed (class_weight experiments showed 0.015+max_rounds=1000 >> 0.05+max_rounds=100).
-  # outer_bags=[8,14]: old grid locked at 4; library default 8-16 reduces variance at k=500.
-  # max_rounds=[500,1000] with early_stopping_rounds=100: oversampling no longer inflates
-  #   internal val loss, so early stopping triggers later and needs a higher ceiling.
-  # CHANGED (2026-06-21): k=500 sweep, no-oversampling + balanced sample_weight EBM path.
-  #   Previous grid (interactions=[2,4], outer_bags=4, max_rounds=[50,100], lr=[0.05,0.1])
-  #   was tuned under minority oversampling which corrupted EBM's outer_bags val splits.
   grid_search:
     max_bins: [128]
     interactions: [4, 6]
@@ -171,12 +148,6 @@ GAMINET:
     max_epochs: [50, 50, 50]
     device: "cuda"
 
-  # Grid: 3x2x1x3x1 = 18 combinations (interact_num x batch_size x activation x reg_clarity x max_epochs)
-  # CHANGED (2026-06-21): activation locked to ReLU (won all 5 folds); max_epochs fixed to [50,150,100]
-  #   (interaction stage extended to 150 so 8-10 pairwise terms have room to converge;
-  #    fine-tune extended to 100); interact_num pushed to 10 (50-feature space has 1225 pairs,
-  #    previous ceiling of 6 likely underfit); batch_size 512 added (more gradient steps/epoch
-  #    on 4.8% minority class); reg_clarity expanded to [0.05,0.1,0.2] around the winning 0.1.
   grid_search:
     interact_num: [6, 8, 10]
     batch_size: [512, 1024]
@@ -214,16 +185,16 @@ IGANN:
 
 NAM:
   default:
-    num_basis_functions: 64      # paper uses 1000 for ~10 features; 64 for 200-feature wide setting
+    num_basis_functions: 64
     hidden_sizes: []
     dropout: 0.1
     feature_dropout: 0.0
     output_regularization: 0.05
-    l2_regularization: 0.0       # ExU weights init at 4.0; L2 would collapse them — use 0.0
+    l2_regularization: 0.0
     lr: 0.01
-    num_epochs: 100
+    num_epochs: 30
     batch_size: 2048
-    early_stopping_patience: 20
+    early_stopping_patience: 8
     val_fraction: 0.15
     device: "cpu"
     random_state: 42
@@ -245,26 +216,13 @@ NAM:
     random_state: [42]
     verbose: [0]
 
-DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam::mvgam()
-  # Locked-in default (2026-07-27), chosen from a wall-clock/quality sweep on
-  # real MIMIC data (5-fold, top-250 tree-selected VM features, mimic_cohort_NF_30_days):
-  #   max_labs=5, burnin/samples=100/100  -> 19m49s, AUC-ROC 0.7510 +/- 0.0430
-  #   max_labs=3, burnin/samples=50/50    -> 10m05s, AUC-ROC 0.7134 +/- 0.0242
-  #                                          (degraded consistently across every
-  #                                          metric with tighter stddev — real
-  #                                          underfitting, not fold noise)
-  #   max_labs=4, burnin/samples=75/75    -> 12m16s, AUC-ROC 0.7444 +/- 0.0411  <- this one
-  # max_labs=4/burnin=75 matches the max_labs=5 config's quality (well within
-  # each other's stddev, similar stddev magnitude) at a ~38% time cut, while
-  # avoiding the max_labs=3 config's genuine quality loss. Don't push burnin/
-  # samples or max_labs lower without re-checking AUC-ROC against this
-  # baseline (0.7444 +/- 0.0411) the same way.
+DGAM:
   default:
     k_lag: 3
     k_val: 3
     max_labs: 4
     min_lags: 3
-    trend_model: "None"          # cross-sectional rows, not a shared time series
+    trend_model: "None"
     family: bernoulli
     backend: cmdstanr
     chains: 2
@@ -273,7 +231,7 @@ DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam
     thin: 1
     parallel: true
     random_state: 42
-    timeout: 450                 # safety net only, not the speed lever
+    timeout: 450
 
   grid_search:
     k_lag: [3, 4]
@@ -292,11 +250,6 @@ DGAM:                          # distributed-lag GAM — thin wrapper on R mvgam
     timeout: [450]
 
 MGAM:
-  # M-GAM with VMD features: VD as continuous base, M as missingness intercepts,
-  # M_{i,b_miss} x V_{i,b_obs} / D_{i,b_obs} cross-bin interactions per itemid.
-  # Requires feat_type=VMD (or VM/VD/MD subsets).
-  # Backend: fastsparsegams L0-penalized logistic regression on continuous features.
-  # max_support_size controls sparsity (analogous to 1/C in LR).
   default:
     max_support_size: 40
     num_lambda: 50
@@ -308,50 +261,21 @@ MGAM:
   grid_search:
     max_support_size: [20, 40, 80, 150]
 
-SSTGAM:                        # Shared-Shape Temporal GAM (own-repo rewrite, 2026-07-25).
-                               # One shape function per feature over (value, time):
-                               #   f_k(value, time) -- a single fitted surface, no separate
-                               #   g(value)/h(value,time) decomposition (that framing predates
-                               #   the rewrite; see sstgam/ARCHITECTURE.md).
-                               # Missing cells contribute 0 (observed mask), not an imputed value.
-                               # Requires feat_type=VMD / V*.
-                               # fit_method="joint" (AdamW) is not supported — sstgam_wrapper.py
-                               # raises a clear ValueError if requested.
-                               # UPDATED 2026-07-25 for the sstgam package rewrite:
-                               #   max_depth -> tree_depth; lam_temporal -> temporal_penalty;
-                               #   lam_static -> static_penalty (renamed).
-                               #   day_split_depth/smoothing_rounds/outer_bags/max_labs --
-                               #   REMOVED from the constructor entirely: no adaptive axis-order
-                               #   tree logic, no smoothing warmup, no outer-bag bootstrap
-                               #   averaging, no internal feature cap any more (single fit, no
-                               #   bagging, no internal selection -- see sstgam/tree_boost.py,
-                               #   sstgam/boosting.py, sstgam/_base.py).
+SSTGAM:
   default:
-    fit_method: tree            # "tree" (histogram boosting over a joint value x time table,
-                               # default) | "boost" (-> method="spline", closed-form Newton
-                               # boosting of smooth RBF shape functions)
-    # n_value_bins/tree_depth retuned 2026-07-25 (grid search, lookback=3/
-    # top_k=250): 8/2 beats 16/3 by +0.30pp AUC-ROC now that the sstgam
-    # rewrite has no bagging/adaptive-axis splitting to control overfitting.
-    n_value_bins: 8            # tree-only; ignored under fit_method=boost
+    fit_method: tree
+    n_value_bins: 8
     tree_depth: 2
-    n_value_bases: 8           # spline-only; ignored under fit_method=tree
+    n_value_bases: 8
     temporal_penalty: 1.0
     static_penalty: 1.0
-    learning_rate: 0.02        # shrinkage — low + many rounds = EBM-style regularisation
+    learning_rate: 0.02
     max_rounds: 100
     early_stopping_rounds: 15
     val_fraction: 0.15
     random_state: 42
     verbose: 1
 
-  # TREE grid (2026-07-26, lookback=15/top_k=250 sweep): n_value_bins and
-  # tree_depth were the levers that actually moved AUC-ROC in the earlier
-  # 2-fold scan; learning_rate had a small secondary effect (0.01/0.02 beat
-  # 0.05 everywhere). fit_method pinned to [tree] -- run the SPLINE grid
-  # (see handoff notes) as a separate pass with its own param set, since
-  # mixing both hyperparameter spaces in one GridSearchCV would waste
-  # compute evaluating tree-only/spline-only params under the wrong method.
   grid_search:
     fit_method: [tree]
     n_value_bins: [16, 32]

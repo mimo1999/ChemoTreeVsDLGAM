@@ -106,6 +106,7 @@ class SSTGAMClassifier(BaseWrapperClassifier):
         max_rounds: int = 100,
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
+        outer_bags: int = 4,
         random_state: int = 42,
         verbose: int = 0,
     ):
@@ -122,6 +123,7 @@ class SSTGAMClassifier(BaseWrapperClassifier):
         self.max_rounds = max_rounds
         self.early_stopping_rounds = early_stopping_rounds
         self.val_fraction = val_fraction
+        self.outer_bags = outer_bags
         self.random_state = random_state
         self.verbose = verbose
 
@@ -155,6 +157,7 @@ class SSTGAMClassifier(BaseWrapperClassifier):
             max_rounds=self.max_rounds,
             early_stopping_rounds=self.early_stopping_rounds,
             val_fraction=self.val_fraction,
+            outer_bags=self.outer_bags,
             random_state=self.random_state,
             verbose=self.verbose,
         )

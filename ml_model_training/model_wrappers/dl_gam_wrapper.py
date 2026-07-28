@@ -16,22 +16,6 @@ This wrapper does not implement its own model. It only:
 Everything else (the MCMC sampling, the smooth basis construction, the
 trend model) is ``mvgam``'s, not this repo's.
 
-Model
------
-For patient i, lab k, and lag bin ell (1..L, the daily bin index):
-
-    logit(p_i) = beta0 + sum_k te(V_k, Lag)_i + z_i
-
-``te(V_k, Lag)`` is mgcv's matrix-argument tensor-product convention:
-mvgam builds this internally as a distributed-lag basis over the value axis
-and the lag axis jointly (see the case study above). ``z_i`` is mvgam's
-latent trend term, controlled by ``trend_model``. Because this is
-terminal-label classification (one row per patient, not a time series),
-each patient is a length-1 series and ``trend_model`` defaults to
-``"None"`` — there is no within-series autocorrelation to estimate here;
-the parameter is exposed rather than hidden so this restriction is explicit
-and can be revisited if the data model changes.
-
 Feature-name conventions (from ml_feature_matrix_builder.py, VMD)
 ------------------------------------------------------------------
     X_<itemid>_<bin>   lab value at a daily bin    -> Value/Lag matrix pair
