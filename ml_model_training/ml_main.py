@@ -206,14 +206,14 @@ def main():
                         help='Restrict feature window to the last N days before discharge. '
                              'None (default) uses the full observation window.')
     parser.add_argument('--selector_type', type=str, default='tree',
-                        choices=['none', 'tree', 'mi', 'correlation', 'xgb_gain', 'stab_net'],
+                        choices=['none', 'tree', 'mi', 'correlation', 'xgb_gain', 'lasso'],
                         help='Feature selector when --feature_selection 1 is set. '
                              '"none"        = passthrough, no column removal; '
                              '"tree"        = RandomForest MDI importance; '
                              '"mi"          = mutual information (SelectKBest); '
                              '"correlation" = top-K by |feature-target Pearson correlation|; '
                              '"xgb_gain"   = XGBoost gain importance; '
-                             '"stab_net"   = elastic-net stability selection')
+                             '"lasso"      = L1-regularized logistic regression')
     parser.add_argument('--load_data', type=lambda x: bool(int(x)), default=False)
     parser.add_argument('--feat_type', type=str,
                        choices=["standard", "V", "M", "D", "VMD", "VM", "VD", "MD", "A"],

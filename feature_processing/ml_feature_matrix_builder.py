@@ -401,6 +401,18 @@ class TimeSeriesExtractor(BaseFeatureExtractor):
             selected_features = cc_top_features.itemid.head(100)
             data = data[data["itemid"].isin(selected_features)]
 
+        # Lookback window — restrict to the last N bins before discharge.
+        # Applied before any feature computation so every feat_type (VMD,
+        # A, ...) benefits automatically. This is a hard restriction: bins
+        # outside the window are dropped from `data` entirely before any
+        # dispatch branch runs, not aggregated or otherwise summarized.
+        lookback_days = kwargs.get('lookback_days', None)
+        if lookback_days is not None and lookback_days > 0:
+            all_available_bins = sorted(data["bin"].unique())
+            lookback_bins = set(all_available_bins[-lookback_days:])
+            data = data[data["bin"].isin(lookback_bins)]
+            print(f"[lookback] Restricting to last {lookback_days} bins: {sorted(lookback_bins)}")
+
         # ------------------------------------------------------------------
         # Approach A — refined single-phase set (median, mean, min, max,
         # std, latest_zscore, robust_trend, observed_fraction) covering

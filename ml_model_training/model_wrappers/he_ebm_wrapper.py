@@ -61,7 +61,7 @@ from sklearn.utils.validation import check_is_fitted
 from interpret.glassbox import ExplainableBoostingClassifier
 
 from config.constants import RANDOM_SEED, PROJECT_ROOT, BEST_PARAMS
-from utils.feature_selector import TreeFeatureSelector
+from feature_processing.feature_selector import TreeFeatureSelector
 from utils.feature_naming import parse_vmd_column
 from ._base import BaseWrapperClassifier
 

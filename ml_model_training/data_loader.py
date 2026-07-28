@@ -8,9 +8,9 @@ from typing import Tuple, Any
 import numpy as np
 import pandas as pd
 
-from utils.feature_selector import (
+from feature_processing.feature_selector import (
     TreeFeatureSelector, TopKFeatureSelector, CorrelationFeatureSelector,
-    XGBGainSelector, StabilityNetSelector,
+    XGBGainSelector, LassoFeatureSelector,
 )
 from utils.preprocessing_utils import fit_transform_gender, oversample_minority_with_groups
 from feature_processing.ml_feature_matrix_builder import FeatureExtractorFactory
@@ -52,7 +52,9 @@ class DataLoader:
             selector_type: Feature selector to use when feature_selection_boolen=True.
                            'tree'        = RandomForest MDI importance (TreeFeatureSelector),
                            'mi'          = Mutual Information SelectKBest (TopKFeatureSelector),
-                           'correlation' = |feature-target correlation| top-K.
+                           'correlation' = |feature-target correlation| top-K,
+                           'xgb_gain'    = XGBoost gain importance,
+                           'lasso'       = L1-regularized logistic regression.
             lookback_days: Restrict feature window to the last N calendar days before
                            discharge. None (default) = use the full observation window.
         """
@@ -194,9 +196,9 @@ class DataLoader:
         elif self.selector_type == 'xgb_gain':
             selector = XGBGainSelector(max_features=self.top_k_features, random_state=42)
             label = 'XGB Gain (XGBoost gain importance)'
-        elif self.selector_type == 'stab_net':
-            selector = StabilityNetSelector(max_features=self.top_k_features, random_state=42)
-            label = 'StabilityNet (elastic-net stability selection)'
+        elif self.selector_type == 'lasso':
+            selector = LassoFeatureSelector(max_features=self.top_k_features, random_state=42)
+            label = 'Lasso (L1-regularized logistic regression)'
         else:  # 'tree'
             selector = TreeFeatureSelector(max_features=self.top_k_features, n_estimators=100, max_depth=5, random_state=42)
             label = 'Tree (RF importance)'

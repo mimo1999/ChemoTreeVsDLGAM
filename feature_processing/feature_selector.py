@@ -1,53 +1,29 @@
 """
 Centralized feature-selection helpers for the ML pipeline.
 
-Six selectors sharing a common fit_transform / transform / get_selected_features API:
+Five selectors sharing a common fit_transform / transform / get_selected_features API:
 
-    TopKFeatureSelector  (mi)        — mutual-information SelectKBest
-    TreeFeatureSelector  (tree)      — RandomForest MDI importance
-    CorrelationFeatureSelector       — |feature-target Pearson correlation|
-    XGBGainSelector      (xgb_gain)  — XGBoost gain importance
-    StabilityNetSelector (stab_net)  — elastic-net stability selection
-    RecencyFeatureSelector           — drop early-phase time bins by column name
+    TopKFeatureSelector  (mi)          — mutual-information SelectKBest
+    TreeFeatureSelector  (tree)        — RandomForest MDI importance
+    CorrelationFeatureSelector         — |feature-target Pearson correlation|
+    XGBGainSelector      (xgb_gain)    — XGBoost gain importance
+    LassoFeatureSelector (lasso)       — L1-regularized logistic regression
 
 Use build_selector(selector_type, max_features, ...) to construct the right selector,
 or use FeatureSelector as a unified facade.
 """
 
-import re
-from collections.abc import Iterable
 from functools import partial
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import (
-    SelectFromModel, SelectKBest, f_classif, mutual_info_classif,
-)
+from sklearn.feature_selection import SelectFromModel, SelectKBest, mutual_info_classif
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-
-
-# ---------------------------------------------------------------------------
-# Column-name patterns used by RecencyFeatureSelector
-# ---------------------------------------------------------------------------
-#
-#   V / standard / M / D / VMD       : "<itemid>_<bin>"            e.g. "50912_0"
-#   V_MGAM cutoff column             : "<itemid>_<bin>__le__<v>"   e.g. "50912_3__le__1.2"
-#   V_MGAM missingness intercept     : "<itemid>_<bin>__eq__NaN"   e.g. "50912_3__eq__NaN"
-#   V_MGAM interaction               : "<col>__missing_AND_<col>__le__<v>"
-#   A / AM "five-feature" columns    : "<itemid>_B<n>_<feature>"   e.g. "50912_B1_mean"
-#   AM missingness flag              : "<itemid>_B<n>_mean_missing"
-#   demographics                     : "age", "gender"
-
-_BIN_RE = re.compile(r"_(\d+)(?:__|$)")
-_A_BIN_RE = re.compile(r"_B(\d+)_")
-
-_RECENCY_DEFAULT_DROP_BINS = (0, 1, 2, 3, 4)
-_RECENCY_DEFAULT_DROP_B_BINS = (1,)
 
 
 def _picklable_mi_score(X, y, random_state=42):
@@ -363,210 +339,93 @@ class XGBGainSelector:
 
 
 # ---------------------------------------------------------------------------
-# StabilityNetSelector — elastic-net stability selection
+# LassoFeatureSelector — L1-regularized logistic regression
 # ---------------------------------------------------------------------------
 
-class StabilityNetSelector:
-    """F-test screen -> elastic-net stability selection -> top-K by selection frequency.
+class LassoFeatureSelector:
+    """Standardize -> L1 logistic regression -> top-K by |coefficient|.
+
+    Embedded feature selection using L1-regularized logistic regression.
 
     Parameters
     ----------
     max_features : int, default 250
-    screen : int, default 2000
-        F-test screen size before the elastic-net stage.
-    n_bootstrap : int, default 25
-    sample_fraction : float, default 0.6
-    C : float, default 0.5
-    l1_ratio : float, default 0.5
-    max_iter : int, default 200
+    C : float, default 0.1
     random_state : int, default 42
+    max_iter : int, default 1000
     """
 
     def __init__(
         self,
         max_features: int = 250,
-        screen: int = 2000,
-        n_bootstrap: int = 25,
-        sample_fraction: float = 0.6,
-        C: float = 0.5,
-        l1_ratio: float = 0.5,
-        max_iter: int = 200,
+        C: float = 0.1,
         random_state: int = 42,
+        max_iter: int = 1000,
     ):
         self.max_features = max_features
-        self.screen = screen
-        self.n_bootstrap = n_bootstrap
-        self.sample_fraction = sample_fraction
         self.C = C
-        self.l1_ratio = l1_ratio
-        self.max_iter = max_iter
         self.random_state = random_state
+        self.max_iter = max_iter
 
     def fit_transform(self, X, y, feature_names=None) -> np.ndarray:
         X_df = _as_dataframe(X, feature_names)
         self.feature_names_in_: List[str] = list(X_df.columns)
-        n_feats = X_df.shape[1]
+        X_arr = X_df.to_numpy()
 
-        self.imputer_ = SimpleImputer(strategy="median")
-        X_imp = self.imputer_.fit_transform(X_df)
-        X_std = StandardScaler().fit_transform(X_imp)
-        y_arr = np.ravel(y)
+        self.pre_scaler_ = StandardScaler()
+        X_std = self.pre_scaler_.fit_transform(X_arr)
 
-        f_scores = np.nan_to_num(f_classif(X_std, y_arr)[0])
-        screen_n = int(min(self.screen, n_feats))
-        screen_idx = np.argsort(f_scores)[::-1][:screen_n]
-        screen_names = [self.feature_names_in_[i] for i in screen_idx]
-        X_screen = X_std[:, screen_idx]
+        clf = LogisticRegression(
+            penalty="l1", solver="saga", C=self.C, class_weight="balanced",
+            max_iter=self.max_iter, random_state=self.random_state, n_jobs=-1,
+        )
+        clf.fit(X_std, np.ravel(y))
 
-        n_samples = X_screen.shape[0]
-        boot_n = int(self.sample_fraction * n_samples)
-        sel_count = np.zeros(screen_n)
-        coef_sum = np.zeros(screen_n)
-        for b in range(self.n_bootstrap):
-            rng = np.random.RandomState(self.random_state + b)
-            idx = rng.choice(n_samples, boot_n, replace=False)
-            if len(np.unique(y_arr[idx])) < 2:
-                continue
-            clf = LogisticRegression(
-                penalty="elasticnet", solver="saga", l1_ratio=self.l1_ratio,
-                C=self.C, class_weight="balanced", max_iter=self.max_iter,
-                tol=1e-3, random_state=self.random_state,
-            )
-            clf.fit(X_screen[idx], y_arr[idx])
-            coef = np.abs(clf.coef_.ravel())
-            sel_count += (coef > 0)
-            coef_sum += coef
+        coef = np.abs(clf.coef_.ravel())
+        order = np.argsort(coef)[::-1]
+        k = int(min(self.max_features, len(order)))
+        selected = sorted(order[:k])
 
-        freq = sel_count / max(self.n_bootstrap, 1)
-        mean_coef = coef_sum / max(self.n_bootstrap, 1)
-        self.selection_frequency_ = pd.Series(freq, index=screen_names)
+        self.selected_features_: List[str] = [self.feature_names_in_[i] for i in selected]
+        self.importance_scores_ = pd.Series(coef, index=self.feature_names_in_)
 
-        order = np.lexsort((-mean_coef, -freq))
-        k = int(min(self.max_features, screen_n))
-        selected_top = set(np.array(screen_names)[order[:k]])
-        self.selected_features_: List[str] = [
-            c for c in self.feature_names_in_ if c in selected_top
-        ]
-
-        X_sel = X_imp[:, [self.feature_names_in_.index(c) for c in self.selected_features_]]
+        X_sel = X_arr[:, selected]
         self.scaler_ = StandardScaler()
         X_scaled = self.scaler_.fit_transform(X_sel)
         print(
-            f"[StabilityNetSelector] {n_feats} input -> {screen_n} F-screened -> "
-            f"{X_scaled.shape[1]} selected (top-{k} by selection freq)"
+            f"[LassoSelector] {X_arr.shape[1]} input -> "
+            f"{X_scaled.shape[1]} selected (top-{k} |L1 coefficient|)"
         )
         return X_scaled
 
     def transform(self, X) -> np.ndarray:
-        if not hasattr(self, "imputer_"):
-            raise RuntimeError("StabilityNetSelector.transform called before fit_transform")
+        if not hasattr(self, "scaler_"):
+            raise RuntimeError("LassoFeatureSelector.transform called before fit_transform")
         X_df = _as_dataframe(X, self.feature_names_in_)
-        X_imp = self.imputer_.transform(X_df)
-        X_sel = X_imp[:, [self.feature_names_in_.index(c) for c in self.selected_features_]]
+        idx = [self.feature_names_in_.index(c) for c in self.selected_features_]
+        X_sel = X_df.to_numpy()[:, idx]
         return self.scaler_.transform(X_sel)
 
     def get_selected_features(self) -> List[str]:
         return list(getattr(self, "selected_features_", []))
 
-    def get_selection_frequency(self) -> pd.Series:
-        if not hasattr(self, "selection_frequency_"):
-            raise RuntimeError("StabilityNetSelector.get_selection_frequency called before fit_transform")
-        sel = [c for c in self.selected_features_ if c in self.selection_frequency_.index]
-        return self.selection_frequency_[sel].sort_values(ascending=False)
-
-
-# ---------------------------------------------------------------------------
-# RecencyFeatureSelector — drop early-phase time bins by column name
-# ---------------------------------------------------------------------------
-
-class RecencyFeatureSelector:
-    """Drop columns encoding early observation-window measurements.
-
-    Non-statistical: parses the temporal index embedded in the column name
-    and keeps only the later bins. No fit over X or y.
-
-    Parameters
-    ----------
-    drop_bins : sequence of int, optional
-        Bin indices to drop for ``<itemid>_<bin>``-style columns (V, M, D,
-        VMD, V_MGAM, standard feat_types). Default: (0,1,2,3,4).
-    drop_b_bins : sequence of int, optional
-        B-bin indices (1-based) to drop for ``<itemid>_B<n>_<feature>``-style
-        columns (A, AM feat_types). Default: (1,).
-    drop_unmatched : bool, default False
-        If True, also drop columns matching neither pattern.
-    """
-
-    def __init__(
-        self,
-        drop_bins: Optional[Sequence[int]] = None,
-        drop_b_bins: Optional[Sequence[int]] = None,
-        drop_unmatched: bool = False,
-    ):
-        self.drop_bins = set(int(b) for b in (drop_bins or ()))
-        self.drop_b_bins = set(int(b) for b in (drop_b_bins or ()))
-        self.drop_unmatched = bool(drop_unmatched)
-
-    def _keep_column(self, col: str) -> bool:
-        m_a = _A_BIN_RE.search(col)
-        if m_a is not None:
-            return int(m_a.group(1)) not in self.drop_b_bins
-        m = _BIN_RE.search(col)
-        if m is not None:
-            return int(m.group(1)) not in self.drop_bins
-        return not self.drop_unmatched
-
-    def fit_transform(self, X, y=None, feature_names=None) -> pd.DataFrame:
-        if isinstance(X, np.ndarray):
-            if feature_names is None:
-                raise ValueError(
-                    "RecencyFeatureSelector.fit_transform on an ndarray requires feature_names."
-                )
-            X_df = pd.DataFrame(X, columns=list(feature_names))
-        else:
-            X_df = X.copy()
-            if feature_names is not None:
-                X_df.columns = list(feature_names)
-
-        self.feature_names_in_: List[str] = list(X_df.columns)
-        self.selected_features_: List[str] = [
-            c for c in self.feature_names_in_ if self._keep_column(c)
-        ]
-        self.dropped_features_: List[str] = [
-            c for c in self.feature_names_in_ if c not in set(self.selected_features_)
-        ]
-        return X_df.loc[:, self.selected_features_]
-
-    def transform(self, X) -> pd.DataFrame:
-        if not hasattr(self, "selected_features_"):
-            raise RuntimeError("RecencyFeatureSelector.transform called before fit_transform")
-        if isinstance(X, np.ndarray):
-            X_df = pd.DataFrame(X, columns=self.feature_names_in_)
-        else:
-            X_df = X
-        cols = [c for c in self.selected_features_ if c in X_df.columns]
-        return X_df.loc[:, cols]
-
-    def get_selected_features(self) -> List[str]:
-        return list(getattr(self, "selected_features_", []))
-
-    def get_dropped_features(self) -> List[str]:
-        return list(getattr(self, "dropped_features_", []))
+    def get_feature_importances(self) -> pd.Series:
+        if not hasattr(self, "importance_scores_"):
+            raise RuntimeError("LassoFeatureSelector.get_feature_importances called before fit_transform")
+        return self.importance_scores_[self.selected_features_].sort_values(ascending=False)
 
 
 # ---------------------------------------------------------------------------
 # build_selector — factory function
 # ---------------------------------------------------------------------------
 
-_SELECTOR_TYPES = ("mi", "tree", "correlation", "xgb_gain", "stab_net", "recency")
+_SELECTOR_TYPES = ("mi", "tree", "correlation", "xgb_gain", "lasso")
 
 
 def build_selector(
     selector_type: str = "mi",
     max_features: int = 250,
     random_state: int = 42,
-    drop_bins: Optional[Sequence[int]] = None,
-    drop_b_bins: Optional[Sequence[int]] = None,
     **kwargs,
 ):
     """Construct a selector by name.
@@ -574,12 +433,9 @@ def build_selector(
     Parameters
     ----------
     selector_type : str
-        One of 'mi', 'tree', 'correlation', 'xgb_gain', 'stab_net', 'recency'.
+        One of 'mi', 'tree', 'correlation', 'xgb_gain', 'lasso'.
     max_features : int, default 250
-        Top-K cap (ignored for 'recency').
     random_state : int, default 42
-    drop_bins, drop_b_bins : sequence of int, optional
-        Forwarded to RecencyFeatureSelector when selector_type='recency'.
     **kwargs
         Extra keyword arguments forwarded to the selector constructor.
     """
@@ -592,13 +448,8 @@ def build_selector(
         return CorrelationFeatureSelector(max_features=max_features, random_state=random_state, **kwargs)
     if st == "xgb_gain":
         return XGBGainSelector(max_features=max_features, random_state=random_state, **kwargs)
-    if st == "stab_net":
-        return StabilityNetSelector(max_features=max_features, random_state=random_state, **kwargs)
-    if st in ("recency", "early_phase", "drop_early"):
-        return RecencyFeatureSelector(
-            drop_bins=drop_bins if drop_bins is not None else _RECENCY_DEFAULT_DROP_BINS,
-            drop_b_bins=drop_b_bins if drop_b_bins is not None else _RECENCY_DEFAULT_DROP_B_BINS,
-        )
+    if st == "lasso":
+        return LassoFeatureSelector(max_features=max_features, random_state=random_state, **kwargs)
     raise ValueError(
         f"Unknown selector_type '{selector_type}'. "
         f"Available: {_SELECTOR_TYPES}"
@@ -615,15 +466,10 @@ class FeatureSelector:
     Parameters
     ----------
     selector_type : str, default 'mi'
-        One of 'mi', 'tree', 'correlation', 'xgb_gain', 'stab_net', 'recency'.
+        One of 'mi', 'tree', 'correlation', 'xgb_gain', 'lasso'.
         Also accepts legacy score_func aliases 'mutual_info_classif' and 'mi'.
     max_features : int, default 250
-        Top-K cap (ignored for 'recency').
     random_state : int, default 42
-    drop_bins, drop_b_bins : sequence of int, optional
-        Forwarded to RecencyFeatureSelector when selector_type='recency'.
-    drop_unmatched : bool, default False
-        RecencyFeatureSelector only.
     """
 
     def __init__(
@@ -631,9 +477,6 @@ class FeatureSelector:
         selector_type: str = "mi",
         max_features: int = 250,
         random_state: int = 42,
-        drop_bins: Optional[Sequence[int]] = None,
-        drop_b_bins: Optional[Sequence[int]] = None,
-        drop_unmatched: bool = False,
         # backward-compat alias
         score_func: Optional[str] = None,
     ):
@@ -644,16 +487,11 @@ class FeatureSelector:
         self.selector_type = selector_type
         self.max_features = max_features
         self.random_state = random_state
-        self.drop_bins = drop_bins
-        self.drop_b_bins = drop_b_bins
-        self.drop_unmatched = drop_unmatched
 
         self._inner = build_selector(
             selector_type=selector_type,
             max_features=max_features,
             random_state=random_state,
-            drop_bins=drop_bins,
-            drop_b_bins=drop_b_bins,
         )
 
     def fit_transform(self, X, y=None, feature_names=None):
