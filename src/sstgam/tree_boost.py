@@ -3,26 +3,16 @@
 import numpy as np
 from sklearn.tree import DecisionTreeRegressor
 
-from ._training import make_validation_split
+from ._training import make_validation_split, weighted_log_loss
 
 _MIN_HESSIAN = 1e-6
 
-# Penalty (weighted-SSE-gain units) applied to a single-axis candidate
-# split's achieved gain per log-candidate-count, used by the adaptive
-# per-round axis choice to correct the classic CART bias toward whichever
-# axis has more candidate thresholds (usually the value axis, which has far
-# more quantile bins than there are distinct time positions). Not a fit
-# hyperparameter -- a Bonferroni/BIC-style multiple-comparisons correction,
-# same rationale as before this mechanism was briefly removed and
-# reintroduced 2026-07-26.
+# Per-log-candidate-count penalty on split gain, correcting CART's bias
+# toward axes with more candidate thresholds (Bonferroni/BIC-style).
 _AXIS_PENALTY_LAMBDA = 2.0
 
-# Depth given to whichever axis is chosen to split FIRST each round (the
-# remaining max_depth - _FIRST_AXIS_DEPTH levels go to the other axis).
-# Matches the value that used to be exposed as ``day_split_depth`` before
-# this trainer's constructor was simplified; kept as an internal constant
-# here rather than re-exposed, since it was never independently tuned away
-# from 2 in this project's history.
+# Depth of whichever axis splits first each round; the rest of max_depth
+# goes to the other axis.
 _FIRST_AXIS_DEPTH = 2
 
 
@@ -39,23 +29,16 @@ def _quantile_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
 class SharedShapeTemporalGAMTreeBoost:
     """Cyclic boosted GAM with one value-bin by time-bin table per feature.
 
-    The table is updated through shallow regression trees fitted to aggregated
-    Newton statistics. Values are binned per feature using pooled training
-    observations.
+    Tables are updated via shallow regression trees fit to aggregated Newton
+    statistics, with values binned per feature from pooled training data.
 
-    Each per-feature (joint value x time) update is fit via an ADAPTIVE axis
-    choice: a depth-1 candidate split is tried on the value axis and on the
-    time axis separately, each scored by weighted-SSE gain minus a
-    candidate-count penalty, and whichever axis's corrected score is higher
-    splits first -- so the tree can put weight on the time axis when the
-    data actually supports it, rather than defaulting to whichever axis has
-    more candidate thresholds (see ``_AXIS_PENALTY_LAMBDA``). Static (1-D)
-    terms have only one axis and use a plain single-stage tree.
+    Each feature update picks which axis (value or time) splits first via a
+    depth-1 trial split scored by weighted-SSE gain minus a candidate-count
+    penalty (see ``_AXIS_PENALTY_LAMBDA``). Static (1-D) terms use a plain
+    single-stage tree.
 
-    ``outer_bags`` bootstrap-resamples the training rows independently
-    ``outer_bags`` times (the validation split is fixed across bags); each
-    bag's fitted tables are averaged at the end -- the same bagging EBM
-    uses for variance reduction.
+    ``outer_bags`` bagged fits (fixed validation split, bootstrapped training
+    rows) are averaged at the end, as in EBM.
     """
 
     def __init__(
@@ -166,8 +149,7 @@ class SharedShapeTemporalGAMTreeBoost:
             second_column = time_column
 
         if first_depth == 1:
-            # Reuse the depth-1 candidate tree already fit above instead of
-            # refitting an identical tree on the same axis/target/weights.
+            # Reuse the depth-1 candidate tree instead of refitting it.
             first_tree = candidate_tree
         else:
             first_tree = DecisionTreeRegressor(max_depth=first_depth, random_state=rng.randint(0, 2**31 - 1))
@@ -202,12 +184,11 @@ class SharedShapeTemporalGAMTreeBoost:
         return self._tree_update(coordinates, gradient_sum, hessian_sum, rng)
 
     @staticmethod
-    def _log_loss(target, probability, weight) -> float:
-        probability = np.clip(probability, 1e-7, 1.0 - 1e-7)
-        return float(-np.average(
-            target * np.log(probability) + (1.0 - target) * np.log(1.0 - probability),
-            weights=weight,
-        ))
+    def _grad_hess(score, target, weight):
+        probability = 1.0 / (1.0 + np.exp(-score))
+        gradient = weight * (target - probability)
+        hessian = weight * probability * (1.0 - probability)
+        return gradient, hessian
 
     def fit(self, values, observed, static_values, time_coordinates, target,
             sample_weight=None):
@@ -244,8 +225,7 @@ class SharedShapeTemporalGAMTreeBoost:
         static_coordinates = [np.arange(len(edges) - 1, dtype=np.float64)[:, None]
                               for edges in self._static_edges]
 
-        # Validation split fixed across all bags -- only the bootstrap-
-        # resampled training rows differ bag to bag.
+        # Fixed validation split; only the bootstrapped training rows vary by bag.
         train_indices, validation_indices = make_validation_split(
             target, self.val_fraction, self.random_state
         )
@@ -255,7 +235,7 @@ class SharedShapeTemporalGAMTreeBoost:
         accumulated_feature_tables = None
         accumulated_static_tables = None
         self.best_rounds_ = []
-        for bag in range(self.outer_bags):
+        for _ in range(self.outer_bags):
             fit_indices = (train_indices if self.outer_bags == 1
                           else rng.choice(train_indices, size=train_indices.size, replace=True))
             intercept, feature_tables, static_tables, best_round = self._fit_one_bag(
@@ -294,19 +274,16 @@ class SharedShapeTemporalGAMTreeBoost:
         best_round = 0
         rounds_without_improvement = 0
 
+        fit_target, fit_weight = target[fit_indices], weights[fit_indices]
         for round_index in range(1, self.max_rounds + 1):
-            probability = 1.0 / (1.0 + np.exp(-fit_score))
-            gradient = weights[fit_indices] * (target[fit_indices] - probability)
-            hessian = weights[fit_indices] * probability * (1.0 - probability)
+            gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
             intercept_update = gradient.sum() / max(hessian.sum(), _MIN_HESSIAN)
             intercept += self.learning_rate * intercept_update
             fit_score += self.learning_rate * intercept_update
             validation_score += self.learning_rate * intercept_update
 
             for feature_index in range(n_features):
-                probability = 1.0 / (1.0 + np.exp(-fit_score))
-                gradient = weights[fit_indices] * (target[fit_indices] - probability)
-                hessian = weights[fit_indices] * probability * (1.0 - probability)
+                gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
                 update = self._update_temporal_term(
                     gradient, hessian,
                     temporal_cell_ids[feature_index][fit_indices],
@@ -327,9 +304,7 @@ class SharedShapeTemporalGAMTreeBoost:
                 ).sum(axis=1)
 
             for column_index in range(n_static):
-                probability = 1.0 / (1.0 + np.exp(-fit_score))
-                gradient = weights[fit_indices] * (target[fit_indices] - probability)
-                hessian = weights[fit_indices] * probability * (1.0 - probability)
+                gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
                 update = self._update_static_term(
                     gradient, hessian, static_bins[column_index][fit_indices],
                     static_coordinates[column_index], rng,
@@ -341,7 +316,7 @@ class SharedShapeTemporalGAMTreeBoost:
                 validation_score += self.learning_rate * update[static_bins[column_index][validation_indices]]
 
             validation_probability = 1.0 / (1.0 + np.exp(-validation_score))
-            validation_loss = self._log_loss(
+            validation_loss = weighted_log_loss(
                 target[validation_indices], validation_probability, weights[validation_indices]
             )
             if validation_loss < best_loss - 1e-6:
