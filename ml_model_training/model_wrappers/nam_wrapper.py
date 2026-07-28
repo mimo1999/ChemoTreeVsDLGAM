@@ -1,204 +1,239 @@
 """
-NAM (Neural Additive Model) wrapper for the ChemoTreeVsDL pipeline.
+NAM (Neural Additive Model, Agarwal et al., 2021) wrapper for the
+ChemoTreeVsDL pipeline.
 
-Architecture (Agarwal et al., 2021):
-    One FeatureNN per selected feature, each a small MLP with an ExU first
-    layer.  Predictions are the sum of all per-feature outputs + a scalar bias.
-    This gives the same additive interpretability as a GAM but with learned
-    nonlinear shape functions.
+Contains the batched PyTorch architecture (`_BatchedNAM`, `penalized_bce`)
+and the sklearn-API adapter built on top of it (`NAMWrapperClassifier`):
+preprocessing, the training loop with early stopping, and the sklearn
+fit/predict_proba/predict contract.
 
-Pipeline: SimpleImputer → MinMax[0,1] → BatchedNAM
-
-MinMax scaling is required because ExU's exp() can explode on raw z-scores.
-
-The original NAM repo lives at ``ml_model_training/model_wrappers/nam/``.
-The sequential ``FeatureNN`` loop from the repo (200 Python calls / batch) is
-replaced here with a fully-batched 3-D tensor implementation:
-
-    (batch, F) → ExU → (batch, F, U) → bmm → (batch, F, 1) → sum_F → (batch,)
-
-where F = n_selected_features, U = num_basis_functions.  This eliminates the
-Python-overhead bottleneck and reduces wall-clock time by ~50–100x on CPU
-compared to the sequential formulation at 200 features / 1000 units.
-
-Training loop (hand-written, no pytorch_lightning):
-    • penalized BCE loss (output-L2 + weight-L2 regularisation)
-    • feature dropout (randomly zero entire feature columns per batch)
-    • AdamW + cosine-decay LR schedule
-    • early stopping on validation BCE loss (val_fraction of train set)
+Preprocessing:
+    SimpleImputer (median) -> MinMax scaling to [0, 1]
+    MinMax scaling is required because exp(w_i) with w_i ~= 4 (the ExU
+    activation's weight init) can explode on unscaled inputs.
 """
-
-from collections.abc import Iterable
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.utils.validation import check_is_fitted
 
+from config.constants import RANDOM_SEED
+from ._base import BaseWrapperClassifier
 
-# ===================================================================
-# Batched NAM — parallel formulation
-# ===================================================================
 
-class _BatchedExU(nn.Module):
-    """ExU activation applied jointly to all F features.
+# ---------------------------------------------------------------------------
+# Batched PyTorch architecture
+#
+# One sub-network per feature, each a small MLP with an ExU first layer:
+#     h_i(x_i) = clamp(ReLU((x_i - b_i) * exp(w_i)), 0, 1)
+# The model prediction is the sum of all per-feature outputs plus a scalar
+# bias:
+#     logit(x) = sum_i f_i(x_i) + beta
+# This gives the same additive interpretability as a GAM, but with learned
+# nonlinear shape functions.
+#
+# Batched forward pass:
+#     The original NAM repo iterates over individual FeatureNN objects in
+#     Python, which is O(F) sequential PyTorch calls per batch. This
+#     implementation instead stacks all feature weights into 3-D tensors and
+#     runs all F feature networks in a single kernel sweep:
+#
+#         (B, F) -> ExU -> (B, F, U) -> Linear(s) -> (B, F, 1) -> sum_F -> (B,)
+#
+#     This gives a ~50-100x wall-clock speedup on CPU for typical tabular
+#     widths (F ~= 50-250).
+# ---------------------------------------------------------------------------
 
-    Input:  (batch, F)       — one value per feature per sample
-    Output: (batch, F, U)    — U learned basis responses per feature
+class _ExU(nn.Module):
+    """ExU activation applied jointly to all F features in one pass.
 
-    ExU formula (Agarwal et al.):
-        h_i(x_i) = ReLU-n( (x_i − b_i) · exp(w_i) )
-    where b_i ∈ R and w_i ∈ R^U are the bias and weights for feature i.
+    Computes h_i(x_i) = clamp(ReLU((x_i − b_i) · exp(w_i)), 0, 1) for every
+    feature i simultaneously.
+
+    Input  : (B, F)
+    Output : (B, F, U)   — U learned basis responses per feature
     """
 
     def __init__(self, n_features: int, n_units: int) -> None:
         super().__init__()
-        self.n_features = n_features
-        self.n_units = n_units
         self.weights = nn.Parameter(torch.empty(n_features, n_units))
-        self.bias = nn.Parameter(torch.empty(n_features))
+        self.bias    = nn.Parameter(torch.empty(n_features))
         self._init_params()
 
     def _init_params(self) -> None:
+        # Agarwal et al.: W ~ N(4, 0.5) clamped to [3, 5]; b ~ N(0, 0.5).
         with torch.no_grad():
             self.weights.normal_(mean=4.0, std=0.5).clamp_(3.0, 5.0)
             self.bias.normal_(mean=0.0, std=0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        diff = (x - self.bias).unsqueeze(-1)           # (B, F, 1)
-        out = diff * torch.exp(self.weights).unsqueeze(0)  # (B, F, U)
-        return F.relu(out).clamp(max=1.0)               # ReLU-1 capped at n=1
+        # Broadcast: (B, F) → (B, F, 1); weights: (F, U) → (1, F, U)
+        diff = (x - self.bias).unsqueeze(-1)
+        out  = diff * torch.exp(self.weights).unsqueeze(0)
+        return F.relu(out).clamp(max=1.0)
 
 
-class _BatchedLinReLU(nn.Module):
-    """Grouped linear + ReLU: (B, F, in) → (B, F, out)."""
+class _GroupedLinear(nn.Module):
+    """Independent linear layers for each of F features, run in a single bmm.
 
-    def __init__(self, n_features: int, in_features: int, out_features: int) -> None:
+    Applies an independent linear transformation to each feature's hidden
+    representation without mixing information across features.
+
+    Input  : (B, F, in_dim)
+    Output : (B, F, out_dim)
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        in_dim: int,
+        out_dim: int,
+        activation: bool = False,
+    ) -> None:
         super().__init__()
-        self.n_features = n_features
-        self.weights = nn.Parameter(torch.empty(n_features, in_features, out_features))
-        self.bias = nn.Parameter(torch.zeros(n_features, out_features))
-        nn.init.xavier_uniform_(self.weights.view(n_features, in_features, out_features).contiguous())
+        self.activation = activation
+        self.weights = nn.Parameter(torch.empty(n_features, in_dim, out_dim))
+        self.bias    = nn.Parameter(torch.zeros(n_features, out_dim))
+        nn.init.xavier_uniform_(self.weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_t = x.permute(1, 0, 2)                       # (F, B, in)
-        out = torch.bmm(x_t, self.weights)              # (F, B, out)
-        out = out.permute(1, 0, 2)                      # (B, F, out)
-        return F.relu(out + self.bias.unsqueeze(0))
-
-
-class _BatchedLinear(nn.Module):
-    """Grouped linear (no activation): (B, F, in) → (B, F, out)."""
-
-    def __init__(self, n_features: int, in_features: int, out_features: int) -> None:
-        super().__init__()
-        self.weights = nn.Parameter(torch.empty(n_features, in_features, out_features))
-        self.bias = nn.Parameter(torch.zeros(n_features, out_features))
-        nn.init.xavier_uniform_(self.weights.view(n_features, in_features, out_features).contiguous())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_t = x.permute(1, 0, 2)                       # (F, B, in)
-        out = torch.bmm(x_t, self.weights)              # (F, B, out)
-        return (out + self.bias.unsqueeze(1)).permute(1, 0, 2)  # (B, F, out)
+        # (B, F, in) → (F, B, in) @ (F, in, out) → (F, B, out) → (B, F, out)
+        out = torch.bmm(x.permute(1, 0, 2), self.weights).permute(1, 0, 2)
+        out = out + self.bias.unsqueeze(0)
+        return F.relu(out) if self.activation else out
 
 
 class _BatchedNAM(nn.Module):
-    """Batched NAM: all F feature nets run in a single kernel sweep.
+    """All F feature sub-networks executed in a single forward pass.
 
-    forward(x) → (logit, fnn_out)
-        logit:   (B,)     — raw log-odds
-        fnn_out: (B, F)   — per-feature scalar contribution (before sum+bias)
+    Returns (logit, feature_contributions):
+        logit                : (B,)   — raw log-odds
+        feature_contributions: (B, F) — per-feature additive output before sum
     """
 
     def __init__(
         self,
         n_features: int,
         n_units: int,
-        hidden_sizes: list,
-        dropout: float = 0.1,
+        hidden_sizes: list[int],
+        dropout: float,
+        feature_dropout: float,
     ) -> None:
         super().__init__()
-        self.n_features = n_features
-        self.dropout = nn.Dropout(p=dropout)
+        self.feature_dropout = feature_dropout
 
-        layers = [_BatchedExU(n_features, n_units)]
+        # Build per-feature network: ExU → [hidden LinReLU layers] → Linear(1)
+        layers: list[nn.Module] = [_ExU(n_features, n_units)]
         prev = n_units
         for h in hidden_sizes:
-            layers.append(_BatchedLinReLU(n_features, prev, h))
+            layers.append(_GroupedLinear(n_features, prev, h, activation=True))
             prev = h
-        layers.append(_BatchedLinear(n_features, prev, 1))
-        self.layers = nn.ModuleList(layers)
-        self.bias = nn.Parameter(torch.zeros(1))
+        layers.append(_GroupedLinear(n_features, prev, 1, activation=False))
 
-    def forward(self, x: torch.Tensor):
-        out = self.layers[0](x)          # ExU → (B, F, U)
+        self.layers  = nn.ModuleList(layers)
+        self.dropout = nn.Dropout(p=dropout)
+        self.bias    = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.layers[0](x)      # ExU: (B, F) → (B, F, U)
         out = self.dropout(out)
         for layer in self.layers[1:]:
-            out = layer(out)
-            out = self.dropout(out)
-        fnn_out = out.squeeze(-1)        # (B, F)
-        logit = fnn_out.sum(dim=-1) + self.bias  # (B,)
-        return logit, fnn_out
+            out = self.dropout(layer(out))
+
+        # (B, F, 1) → (B, F)
+        contributions = out.squeeze(-1)
+
+        # Feature dropout: zero entire feature sub-networks randomly per batch.
+        # Applied before summing so logit is consistent with masked contributions.
+        if self.training and self.feature_dropout > 0.0:
+            keep = (
+                torch.rand(contributions.shape[1], device=contributions.device)
+                >= self.feature_dropout
+            ).float()
+            contributions = contributions * keep.unsqueeze(0)
+
+        logit = contributions.sum(dim=-1) + self.bias
+        return logit, contributions
 
 
-# ===================================================================
-# Loss
-# ===================================================================
-
-def _penalized_bce(
+def penalized_bce(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    fnn_out: torch.Tensor,
+    contributions: torch.Tensor,
     model: _BatchedNAM,
     output_regularization: float,
     l2_regularization: float,
 ) -> torch.Tensor:
+    """BCE loss + output regularization + L2 on the output linear layer only.
+
+    L2 is deliberately restricted to the final linear layer and NOT applied to
+    ExU weights.  ExU weights are initialized to mean ≈ 4; pulling them toward
+    zero with L2 collapses the activation's effective slope (exp(w) → 1).
+    """
     loss = F.binary_cross_entropy_with_logits(logits.view(-1), targets.view(-1))
+
     if output_regularization > 0.0:
-        loss = loss + output_regularization * torch.mean(fnn_out ** 2)
+        loss = loss + output_regularization * contributions.pow(2).mean()
+
     if l2_regularization > 0.0:
-        last_linear = model.layers[-1]
-        l2 = (last_linear.weights ** 2).sum() + (last_linear.bias ** 2).sum()
-        loss = loss + l2_regularization * l2 / model.n_features
+        output_layer = model.layers[-1]
+        l2 = output_layer.weights.pow(2).sum() + output_layer.bias.pow(2).sum()
+        loss = loss + l2_regularization * l2 / contributions.shape[1]
+
     return loss
 
 
-# ===================================================================
-# sklearn wrapper
-# ===================================================================
+# ---------------------------------------------------------------------------
+# sklearn-compatible wrapper
+# ---------------------------------------------------------------------------
 
-class NAMWrapperClassifier(ClassifierMixin, BaseEstimator):
-    """Batched NAM wrapped with median-imputation + MinMax [0,1] scaling.
+class NAMWrapperClassifier(BaseWrapperClassifier):
+    """Neural Additive Model (Agarwal et al., 2021) with a scikit-learn API.
+
+    Preprocessing is handled internally: median imputation followed by MinMax
+    scaling to [0, 1] (required for ExU numerical stability).
 
     Parameters
     ----------
-    num_basis_functions : int, default 64
-        ExU units per feature.
-    hidden_sizes : list[int], default []
-        Extra grouped linear-ReLU layers after ExU.
-    dropout : float, default 0.1
-    feature_dropout : float, default 0.0
-        Fraction of feature columns randomly zeroed per training batch.
-    output_regularization : float, default 0.1
-    l2_regularization : float, default 0.05
-    lr : float, default 0.01
-    num_epochs : int, default 100
-    batch_size : int, default 1024
-    early_stopping_patience : int, default 20
-    val_fraction : float, default 0.15
-    device : str, default "cuda"
-    random_state : int, default 42
-    verbose : int, default 1
+    num_basis_functions : int
+        ExU units per feature.  The NAM paper uses 1000 for small datasets;
+        64 works well for wide tabular settings (F ≈ 50–250).
+    hidden_sizes : list[int]
+        Extra hidden layers appended after ExU.  Empty list = ExU → Linear(1).
+    dropout : float
+        Dropout probability applied after every layer inside the feature nets.
+    feature_dropout : float
+        Probability of zeroing an entire feature sub-network per training batch.
+        Encourages feature independence.
+    output_regularization : float
+        Penalty coefficient on the mean-squared per-feature contribution.
+    l2_regularization : float
+        L2 penalty coefficient on the output linear layer weights.
+    lr : float
+        AdamW learning rate.
+    num_epochs : int
+        Maximum number of training epochs.
+    batch_size : int
+    early_stopping_patience : int
+        Stop training if validation BCE does not improve for this many epochs.
+    val_fraction : float
+        Fraction of training data held out for early stopping.
+    device : str
+        Requested device ('cuda' or 'cpu').  Falls back to CPU if CUDA is
+        unavailable.
+    random_state : int
+    verbose : int
+        0 = silent.  1 = log every 10 epochs.
     """
 
     def __init__(
         self,
         num_basis_functions: int = 64,
-        hidden_sizes=None,
+        hidden_sizes: list[int] | None = None,
         dropout: float = 0.1,
         feature_dropout: float = 0.0,
         output_regularization: float = 0.1,
@@ -209,118 +244,136 @@ class NAMWrapperClassifier(ClassifierMixin, BaseEstimator):
         early_stopping_patience: int = 20,
         val_fraction: float = 0.15,
         device: str = "cuda",
-        random_state: int = 42,
+        random_state: int = RANDOM_SEED,
         verbose: int = 1,
-    ):
-        self.num_basis_functions = num_basis_functions
-        self.hidden_sizes = hidden_sizes
-        self.dropout = dropout
-        self.feature_dropout = feature_dropout
-        self.output_regularization = output_regularization
-        self.l2_regularization = l2_regularization
-        self.lr = lr
-        self.num_epochs = num_epochs
-        self.batch_size = batch_size
+    ) -> None:
+        self.num_basis_functions    = num_basis_functions
+        self.hidden_sizes           = hidden_sizes
+        self.dropout                = dropout
+        self.feature_dropout        = feature_dropout
+        self.output_regularization  = output_regularization
+        self.l2_regularization      = l2_regularization
+        self.lr                     = lr
+        self.num_epochs             = num_epochs
+        self.batch_size             = batch_size
         self.early_stopping_patience = early_stopping_patience
-        self.val_fraction = val_fraction
-        self.device = device
-        self.random_state = random_state
-        self.verbose = verbose
+        self.val_fraction           = val_fraction
+        self.device                 = device
+        self.random_state           = random_state
+        self.verbose                = verbose
 
     # ------------------------------------------------------------------
-    # Preprocessing
+    # Internal preprocessing (fit-time and transform-time)
     # ------------------------------------------------------------------
 
-    def _preprocess_fit(self, X, y, feature_names):
-        if feature_names is None:
-            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
-        self.selected_features_ = list(feature_names)
+    def _fit_preprocessor(self, X: np.ndarray) -> np.ndarray:
+        """Fit median imputer + MinMax scaler; drop zero-variance columns."""
         self.imputer_ = SimpleImputer(strategy="median")
-        X_out = np.asarray(self.imputer_.fit_transform(X), dtype=np.float32)
-        col_min = X_out.min(axis=0)
-        col_max = X_out.max(axis=0)
-        col_range = col_max - col_min
+        X_imp = np.asarray(self.imputer_.fit_transform(X), dtype=np.float32)
 
-        self._nam_keep_mask_ = col_range > 1e-8
-        if not self._nam_keep_mask_.all():
-            n_drop = int((~self._nam_keep_mask_).sum())
-            print(f"[NAM] dropping {n_drop} zero-variance columns post-selection")
-            X_out = X_out[:, self._nam_keep_mask_]
-            col_min = col_min[self._nam_keep_mask_]
-            col_range = col_range[self._nam_keep_mask_]
+        col_min   = X_imp.min(axis=0)
+        col_range = X_imp.max(axis=0) - col_min
 
-        self._nam_col_min_ = col_min
-        self._nam_col_range_ = col_range
-        return np.clip((X_out - col_min) / col_range, 0.0, 1.0).astype(np.float32)
+        # Drop columns with no variation to avoid division-by-zero in scaling.
+        self.valid_cols_  = col_range > 1e-8
+        n_dropped = int((~self.valid_cols_).sum())
+        if n_dropped:
+            print(f"[NAM] Dropped {n_dropped} zero-variance column(s) after selection.")
 
-    def _preprocess_transform(self, X):
-        check_is_fitted(self, "nam_")
-        Xt = np.asarray(self.imputer_.transform(X), dtype=np.float32)
-        if hasattr(self, "_nam_keep_mask_"):
-            Xt = Xt[:, self._nam_keep_mask_]
-        return np.clip(
-            (Xt - self._nam_col_min_) / self._nam_col_range_, 0.0, 1.0
-        ).astype(np.float32)
+        self.col_min_   = col_min[self.valid_cols_]
+        self.col_scale_ = col_range[self.valid_cols_]
+
+        return self._scale(X_imp[:, self.valid_cols_])
+
+    def _transform(self, X: np.ndarray) -> np.ndarray:
+        X_imp = np.asarray(self.imputer_.transform(X), dtype=np.float32)
+        return self._scale(X_imp[:, self.valid_cols_])
+
+    def _scale(self, X: np.ndarray) -> np.ndarray:
+        return np.clip((X - self.col_min_) / self.col_scale_, 0.0, 1.0).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
 
-    def _train(self, X_tr, y_tr, X_val, y_val, device):
+    def _make_val_split(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Stratified validation split; falls back to random if classes are too sparse."""
+        idx = np.arange(len(y))
+        try:
+            tr_idx, val_idx = train_test_split(
+                idx,
+                test_size=self.val_fraction,
+                random_state=self.random_state,
+                stratify=y,
+            )
+        except ValueError:
+            rng = np.random.RandomState(self.random_state)
+            val_size = max(1, int(len(y) * self.val_fraction))
+            val_idx  = rng.choice(len(y), size=val_size, replace=False)
+            tr_idx   = np.setdiff1d(idx, val_idx)
+
+        return X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
+
+    def _train(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        device: torch.device,
+    ) -> _BatchedNAM:
         torch.manual_seed(self.random_state)
         np.random.seed(self.random_state)
 
-        n_features = X_tr.shape[1]
         model = _BatchedNAM(
-            n_features=n_features,
+            n_features=X_train.shape[1],
             n_units=self.num_basis_functions,
             hidden_sizes=list(self.hidden_sizes or []),
             dropout=self.dropout,
+            feature_dropout=self.feature_dropout,
         ).to(device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=self.lr, weight_decay=1e-4
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.num_epochs, eta_min=self.lr * 0.01
         )
 
-        X_tr_t = torch.as_tensor(X_tr, dtype=torch.float32, device=device)
-        y_tr_t = torch.as_tensor(y_tr, dtype=torch.float32, device=device)
-        X_val_t = torch.as_tensor(X_val, dtype=torch.float32, device=device)
-        y_val_t = torch.as_tensor(y_val, dtype=torch.float32, device=device)
+        X_tr_t  = torch.as_tensor(X_train, device=device)
+        y_tr_t  = torch.as_tensor(y_train, device=device)
+        X_val_t = torch.as_tensor(X_val,   device=device)
+        y_val_t = torch.as_tensor(y_val,   device=device)
 
-        n_tr = X_tr_t.shape[0]
-        best_val_loss = float("inf")
-        best_state = None
-        patience_counter = 0
+        best_val_loss  = float("inf")
+        best_state     = None
+        patience_count = 0
 
         for epoch in range(1, self.num_epochs + 1):
             model.train()
-            perm = torch.randperm(n_tr, device=device)
-            train_loss_acc = 0.0
-            n_batches = 0
+            perm       = torch.randperm(len(X_tr_t), device=device)
+            train_loss = 0.0
+            n_batches  = 0
 
-            for start in range(0, n_tr, self.batch_size):
-                idx = perm[start: start + self.batch_size]
-                Xb, yb = X_tr_t[idx], y_tr_t[idx]
-                logits, fnn_out = model(Xb)
+            for start in range(0, len(X_tr_t), self.batch_size):
+                batch_idx = perm[start : start + self.batch_size]
+                Xb, yb   = X_tr_t[batch_idx], y_tr_t[batch_idx]
 
-                if self.feature_dropout > 0.0:
-                    mask = (
-                        torch.rand(fnn_out.shape[1], device=device) > self.feature_dropout
-                    ).float()
-                    fnn_out = fnn_out * mask.unsqueeze(0)
-                    logits = fnn_out.sum(dim=-1) + model.bias
-
-                loss = _penalized_bce(
-                    logits, yb, fnn_out, model,
+                logits, contributions = model(Xb)
+                loss = penalized_bce(
+                    logits, yb, contributions, model,
                     self.output_regularization, self.l2_regularization,
                 )
+
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
-                train_loss_acc += loss.item()
-                n_batches += 1
+
+                train_loss += loss.item()
+                n_batches  += 1
 
             scheduler.step()
 
@@ -332,21 +385,24 @@ class NAMWrapperClassifier(ClassifierMixin, BaseEstimator):
                 ).item()
 
             if self.verbose and epoch % 10 == 0:
+                avg_train = train_loss / max(n_batches, 1)
                 print(
                     f"[NAM] epoch {epoch:>4}/{self.num_epochs} | "
-                    f"train_loss={train_loss_acc / max(n_batches,1):.4f} | "
-                    f"val_loss={val_loss:.4f}"
+                    f"train_loss={avg_train:.4f} | val_loss={val_loss:.4f}"
                 )
 
             if val_loss < best_val_loss - 1e-5:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
+                best_val_loss  = val_loss
+                best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_count = 0
             else:
-                patience_counter += 1
-                if patience_counter >= self.early_stopping_patience:
+                patience_count += 1
+                if patience_count >= self.early_stopping_patience:
                     if self.verbose:
-                        print(f"[NAM] Early stopping at epoch {epoch} (best val_loss={best_val_loss:.4f})")
+                        print(
+                            f"[NAM] Early stopping at epoch {epoch} "
+                            f"(best val_loss={best_val_loss:.4f})"
+                        )
                     break
 
         if best_state is not None:
@@ -357,80 +413,88 @@ class NAMWrapperClassifier(ClassifierMixin, BaseEstimator):
     # sklearn API
     # ------------------------------------------------------------------
 
-    def fit(self, X, y, feature_names: Iterable[str] | None = None):
+    def fit(
+        self,
+        X,
+        y,
+        feature_names = None,
+    ):
         device = torch.device(
-            self.device if (self.device == "cpu" or torch.cuda.is_available()) else "cpu"
+            self.device
+            if (self.device == "cpu" or torch.cuda.is_available())
+            else "cpu"
         )
 
-        X_scaled = self._preprocess_fit(X, y, feature_names)
-        y_arr = np.asarray(y, dtype=np.float32).ravel()
-        n_features = X_scaled.shape[1]
+        if feature_names is None:
+            feature_names = list(X.columns)
+        self.feature_names_ = list(feature_names)
+
+        X_scaled = self._fit_preprocessor(np.asarray(X, dtype=np.float32))
+        y_arr    = np.asarray(y, dtype=np.float32).ravel()
 
         print(
-            f"[NAM] Training with {n_features} features | "
+            f"[NAM] Training | features={X_scaled.shape[1]} | "
             f"num_basis_functions={self.num_basis_functions} | "
             f"num_epochs={self.num_epochs} | batch_size={self.batch_size} | "
             f"lr={self.lr} | device={device}"
         )
 
-        n_total = len(y_arr)
-        idx = np.arange(n_total)
-        try:
-            tr_idx, val_idx = train_test_split(
-                idx, test_size=self.val_fraction,
-                random_state=self.random_state, stratify=y_arr,
-            )
-        except ValueError:
-            rng = np.random.RandomState(self.random_state)
-            val_idx = rng.choice(n_total, size=max(1, int(n_total * self.val_fraction)), replace=False)
-            tr_mask = np.ones(n_total, dtype=bool)
-            tr_mask[val_idx] = False
-            tr_idx = idx[tr_mask]
+        X_tr, y_tr, X_val, y_val = self._make_val_split(X_scaled, y_arr)
 
         if self.verbose:
             print(
-                f"[NAM] val split | train positives={int(y_arr[tr_idx].sum())}/"
-                f"{len(tr_idx)} | val positives={int(y_arr[val_idx].sum())}/{len(val_idx)}"
+                f"[NAM] Val split | "
+                f"train: {int(y_tr.sum())}/{len(y_tr)} positives | "
+                f"val: {int(y_val.sum())}/{len(y_val)} positives"
             )
 
-        self.nam_ = self._train(X_scaled[tr_idx], y_arr[tr_idx], X_scaled[val_idx], y_arr[val_idx], device)
-        self.device_ = device
+        self.model_   = self._train(X_tr, y_tr, X_val, y_val, device)
+        self.device_  = device
         self.classes_ = np.array([0, 1])
         return self
 
-    def predict_proba(self, X):
-        check_is_fitted(self, "nam_")
-        Xt = torch.as_tensor(self._preprocess_transform(X), dtype=torch.float32, device=self.device_)
-        self.nam_.eval()
+    def predict_proba(self, X) -> np.ndarray:
+        check_is_fitted(self, "model_")
+        X_t = torch.as_tensor(
+            self._transform(np.asarray(X, dtype=np.float32)),
+            device=self.device_,
+        )
+        self.model_.eval()
         with torch.no_grad():
-            logits, _ = self.nam_(Xt)
+            logits, _ = self.model_(X_t)
             proba_pos = torch.sigmoid(logits.view(-1)).cpu().numpy()
         proba_pos = np.clip(proba_pos, 1e-6, 1.0 - 1e-6)
         return np.column_stack([1.0 - proba_pos, proba_pos])
 
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-    def predict_log_proba(self, X):
-        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
+    # predict() / predict_log_proba() are inherited from BaseWrapperClassifier.
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def get_selected_features(self) -> list:
-        check_is_fitted(self, "nam_")
-        return list(self.selected_features_)
+    def get_selected_features(self) -> list[str]:
+        """Return names of features passed to fit() (after zero-variance filtering).
 
-    def get_nam(self) -> _BatchedNAM:
-        check_is_fitted(self, "nam_")
-        return self.nam_
+        Overrides BaseWrapperClassifier's default since NAM drops
+        zero-variance columns internally (see _fit_preprocessor).
+        """
+        check_is_fitted(self, "model_")
+        return [
+            name for name, keep in zip(self.feature_names_, self.valid_cols_) if keep
+        ]
 
     def get_feature_contributions(self, X) -> np.ndarray:
-        """Return per-feature contributions for each sample: shape (n_samples, n_features)."""
-        check_is_fitted(self, "nam_")
-        Xt = torch.as_tensor(self._preprocess_transform(X), dtype=torch.float32, device=self.device_)
-        self.nam_.eval()
+        """Per-feature additive contributions for each sample.
+
+        Returns an array of shape (n_samples, n_active_features).
+        Values are the raw outputs of each feature sub-network before summing.
+        """
+        check_is_fitted(self, "model_")
+        X_t = torch.as_tensor(
+            self._transform(np.asarray(X, dtype=np.float32)),
+            device=self.device_,
+        )
+        self.model_.eval()
         with torch.no_grad():
-            _, fnn_out = self.nam_(Xt)
-        return fnn_out.cpu().numpy()
+            _, contributions = self.model_(X_t)
+        return contributions.cpu().numpy()

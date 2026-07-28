@@ -1,13 +1,11 @@
 """
 GAMINET wrapper for the ChemoTreeVsDL pipeline.
 
-Pipeline: MinMax[0,1] -> GAMINetClassifier
+Pipeline: SimpleImputer -> MinMax[0,1] -> GAMINetClassifier
 
 MinMax scaling is required because GAMINET's internal binner assumes a finite
 support; heavy-tailed lab features can produce extreme z-scores that NaN-out
 the loss at the first epoch when StandardScaler is used instead.
-
-Feature selection and NaN-filling are handled upstream by DataLoader.
 """
 
 from collections.abc import Iterable
@@ -15,23 +13,16 @@ from typing import Tuple
 
 import numpy as np
 
-from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
-
-# piml's GAMINetClassifier still calls BaseEstimator._validate_data, which was
-# removed in sklearn 1.6. Reinstate it as a thin wrapper around the new API.
-if not hasattr(BaseEstimator, "_validate_data"):
-    def _validate_data_compat(self, X="no_validation", y="no_validation", **kwargs):
-        from sklearn.utils.validation import validate_data as _vd
-        return _vd(self, X=X, y=y, **kwargs)
-
-    BaseEstimator._validate_data = _validate_data_compat  # type: ignore[attr-defined]
 
 from piml.models import GAMINetClassifier
 
+from config.constants import RANDOM_SEED
+from ._base import BaseWrapperClassifier
 
-class GAMINetWrapperClassifier(ClassifierMixin, BaseEstimator):
-    """GAMINET wrapped with MinMax [0,1] scaling.
+
+class GAMINetWrapperClassifier(BaseWrapperClassifier):
+    """GAMINET wrapped with median-imputation and MinMax [0,1] scaling.
 
     Parameters
     ----------
@@ -54,7 +45,7 @@ class GAMINetWrapperClassifier(ClassifierMixin, BaseEstimator):
         reg_clarity: float = 0.1,
         max_epochs: Tuple[int, int, int] = (50, 50, 50),
         device: str = "cpu",
-        random_state: int = 0,
+        random_state: int = RANDOM_SEED,
     ):
         self.interact_num = interact_num
         self.batch_size = batch_size
@@ -72,7 +63,7 @@ class GAMINetWrapperClassifier(ClassifierMixin, BaseEstimator):
         sample_weight=None,
     ):
         if feature_names is None:
-            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
+            feature_names = list(X.columns)
         self.selected_features_ = list(feature_names)
 
         X_scaled = np.asarray(X, dtype=np.float32)
@@ -133,15 +124,8 @@ class GAMINetWrapperClassifier(ClassifierMixin, BaseEstimator):
             proba = np.column_stack([1 - proba, proba])
         return proba
 
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-    def predict_log_proba(self, X):
-        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
-
-    def get_selected_features(self):
-        check_is_fitted(self, "gaminet_")
-        return list(self.selected_features_)
+    # predict() / predict_log_proba() / get_selected_features() are inherited
+    # from BaseWrapperClassifier.
 
     def get_gaminet(self):
         check_is_fitted(self, "gaminet_")

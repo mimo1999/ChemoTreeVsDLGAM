@@ -5,29 +5,37 @@ EBM handles missing values natively via a dedicated missing-value bin per
 feature, so pre-imputing would collapse the missing-value signal into a single
 point. It is also tree-based and invariant to monotone rescaling, so
 StandardScaler provides no benefit.
-
-Feature selection is handled upstream by DataLoader.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 
-from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
 from interpret.glassbox import ExplainableBoostingClassifier
 
+from config.constants import RANDOM_SEED
+from ._base import BaseWrapperClassifier
 
-class EBMClassifier(ClassifierMixin, BaseEstimator):
+
+class EBMClassifier(BaseWrapperClassifier):
     """sklearn-compatible wrapper around ExplainableBoostingClassifier.
 
     Parameters
     ----------
     max_bins : int, default 128
         Histogram bin count per feature.
-    interactions : int, default 2
-        Number of pairwise interaction terms added after main effects.
+    interactions : int or Sequence[tuple[str, str]], default 2
+        Either the NUMBER of pairwise interaction terms to auto-discover via
+        EBM's own FAST search, or an explicit list of `(feature_name_a,
+        feature_name_b)` pairs to force as the only interaction terms
+        (skips auto-search entirely — cheaper, and useful for injecting
+        interactions known a priori, e.g. from an external interaction-graph
+        resource). Forwarded as-is to `ExplainableBoostingClassifier`, which
+        natively supports both forms; `feature_names` (from `fit`'s
+        `feature_names` arg or `X.columns`) must contain every name used in
+        an explicit pair.
     outer_bags : int, default 4
         Number of bagged re-fits.
     max_rounds : int, default 100
@@ -44,7 +52,7 @@ class EBMClassifier(ClassifierMixin, BaseEstimator):
     def __init__(
         self,
         max_bins: int = 128,
-        interactions: int = 2,
+        interactions: int | Sequence[tuple[str, str]] = 2,
         outer_bags: int = 4,
         max_rounds: int = 100,
         learning_rate: float = 0.1,
@@ -53,7 +61,7 @@ class EBMClassifier(ClassifierMixin, BaseEstimator):
         early_stopping_rounds: int = 30,
         early_stopping_tolerance: float = 1e-4,
         inner_bags: int = 0,
-        random_state: int = 42,
+        random_state: int = RANDOM_SEED,
     ):
         self.max_bins = max_bins
         self.interactions = interactions
@@ -75,10 +83,10 @@ class EBMClassifier(ClassifierMixin, BaseEstimator):
         sample_weight=None,
     ):
         if feature_names is None:
-            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
+            feature_names = list(X.columns)
         self.selected_features_ = list(feature_names)
 
-        X_arr = X.values if hasattr(X, "values") else np.asarray(X, dtype=float)
+        X_arr = np.asarray(X, dtype=float)
 
         print(
             f"[EBM] Training with {X_arr.shape[1]} features | "
@@ -107,20 +115,13 @@ class EBMClassifier(ClassifierMixin, BaseEstimator):
 
     def _transform_X(self, X):
         check_is_fitted(self, "ebm_")
-        return X.values if hasattr(X, "values") else np.asarray(X, dtype=float)
+        return np.asarray(X, dtype=float)
 
     def predict_proba(self, X):
         return self.ebm_.predict_proba(self._transform_X(X))
 
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-    def predict_log_proba(self, X):
-        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
-
-    def get_selected_features(self):
-        check_is_fitted(self, "ebm_")
-        return list(self.selected_features_)
+    # predict() / predict_log_proba() / get_selected_features() are inherited
+    # from BaseWrapperClassifier.
 
     def get_ebm(self):
         check_is_fitted(self, "ebm_")

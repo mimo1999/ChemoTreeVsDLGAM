@@ -2,12 +2,10 @@
 IGANN (Interpretable Generalized Additive Neural Network) wrapper for the
 ChemoTreeVsDL pipeline.
 
-Pipeline: StandardScaler -> IGANN
+Pipeline: SimpleImputer -> StandardScaler -> IGANN
 
 IGANN fits one ELM (extreme-learning-machine) shape function per feature using
 boosting across per-feature ELMs (Kraus et al., https://github.com/MathiasKraus/igann).
-
-Feature selection and NaN-filling are handled upstream by DataLoader.
 """
 
 from collections.abc import Iterable
@@ -16,16 +14,19 @@ import numpy as np
 import pandas as pd
 import torch
 
-from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
 from igann import IGANN
 
+from config.constants import RANDOM_SEED
+from ._base import BaseWrapperClassifier
 
-class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
-    """IGANN wrapped with StandardScaler.
+
+class IGANNWrapperClassifier(BaseWrapperClassifier):
+    """IGANN wrapped with median-imputation + StandardScaler.
 
     Parameters
     ----------
@@ -40,16 +41,20 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
     n_hid : int, default 10
         Hidden units per ELM shape function.
     init_reg : float, default 1.0
-        Initial regularisation applied to the linear model IGANN bootstraps off of.
+        Initial regularisation applied to the linear model IGANN bootstraps
+        off of.
     act : str, default "elu"
         Activation inside each ELM.
     early_stopping : int, default 50
         IGANN patience — stop boosting after this many rounds without
         validation improvement.
     device : str, default "cpu"
-        CPU is typically faster than CUDA on small clinical datasets.
+        Forwarded to IGANN. CPU is typically faster than CUDA on small
+        clinical datasets per the IGANN maintainers' notes.
     verbose : int, default 0
+        IGANN verbosity (0 = silent).
     random_state : int, default 1
+        Forwarded to IGANN; the feature selector uses its own seed.
     """
 
     def __init__(
@@ -64,7 +69,7 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
         early_stopping: int = 50,
         device: str = "cpu",
         verbose: int = 0,
-        random_state: int = 1,
+        random_state: int = RANDOM_SEED,
     ):
         self.n_estimators = n_estimators
         self.boost_rate = boost_rate
@@ -77,6 +82,10 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
         self.device = device
         self.verbose = verbose
         self.random_state = random_state
+
+    # ------------------------------------------------------------------
+    # sklearn API
+    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -92,24 +101,26 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
         X, y : training data (may be oversampled).
         feature_names : column labels forwarded from the pipeline.
         val_set : optional (X_val, y_val) drawn from the *original*
-            (non-oversampled) distribution. When provided, IGANN uses it
-            for early stopping instead of splitting the training data
-            internally. This gives more reliable early stopping against
-            the real class distribution and typically improves AUC-ROC on
-            imbalanced datasets.
+            (non-oversampled) distribution.  When provided, IGANN uses it
+            for early stopping instead of splitting the (oversampled)
+            training data internally.  This gives more reliable early
+            stopping against the real class distribution and typically
+            improves AUC-ROC by 2–4 pp on imbalanced datasets.
         """
         if feature_names is None:
-            feature_names = list(X.columns) if hasattr(X, "columns") else [f"f{i}" for i in range(X.shape[1])]
+            feature_names = list(X.columns)
         self.selected_features_ = list(feature_names)
+        self.imputer_ = SimpleImputer(strategy="median")
         self.scaler_ = StandardScaler()
-        X_scaled = self.scaler_.fit_transform(X)
+        X_scaled = self.scaler_.fit_transform(self.imputer_.fit_transform(X))
 
         igann_val_set = None
         if val_set is not None:
             X_v, y_v = val_set
-            X_v_scaled = self.scaler_.transform(X_v)
-            # IGANN._preprocess_feature_matrix sorts columns alphabetically;
-            # val_set[0] bypasses that path so we replicate the sort here.
+            X_v_scaled = self.scaler_.transform(self.imputer_.transform(X_v))
+            # IGANN._preprocess_feature_matrix sorts columns alphabetically and
+            # returns a float32 tensor; val_set[0] is used directly without going
+            # through that preprocessing path, so we replicate it here.
             sorted_cols = sorted(self.selected_features_)
             col_order = [self.selected_features_.index(c) for c in sorted_cols]
             X_v_sorted = X_v_scaled[:, col_order]
@@ -119,7 +130,7 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
             )
 
         print(
-            f"[IGANN] Training with {X_scaled.shape[1]} features | "
+            f"[IGANN] Training with {X_scaled.shape[1]} selected features | "
             f"n_estimators={self.n_estimators} | boost_rate={self.boost_rate} | "
             f"n_hid={self.n_hid} | early_stopping={self.early_stopping} | "
             f"val_set={'yes' if igann_val_set is not None else 'internal split'}"
@@ -141,30 +152,30 @@ class IGANNWrapperClassifier(ClassifierMixin, BaseEstimator):
         )
         X_scaled_df = pd.DataFrame(X_scaled, columns=self.selected_features_)
         y_series = pd.Series(np.asarray(y).ravel())
+
         self.igann_.fit(X_scaled_df, y_series, val_set=igann_val_set)
         self.classes_ = np.array([0, 1])
         return self
 
     def _transform_X(self, X):
         check_is_fitted(self, "igann_")
-        X_scaled = self.scaler_.transform(X)
+        X_scaled = self.scaler_.transform(self.imputer_.transform(X))
         return pd.DataFrame(X_scaled, columns=self.selected_features_)
 
     def predict_proba(self, X):
         proba = np.asarray(self.igann_.predict_proba(self._transform_X(X)))
+        # IGANN returns a 2D (n, 2) array; normalise just in case a future
+        # version exposes a 1D shape.
         if proba.ndim == 1:
             proba = np.column_stack([1 - proba, proba])
         return proba
 
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+    # predict() / predict_log_proba() / get_selected_features() are inherited
+    # from BaseWrapperClassifier.
 
-    def predict_log_proba(self, X):
-        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
-
-    def get_selected_features(self):
-        check_is_fitted(self, "igann_")
-        return list(self.selected_features_)
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
 
     def get_igann(self):
         check_is_fitted(self, "igann_")
