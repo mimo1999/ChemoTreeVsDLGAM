@@ -1,5 +1,5 @@
 """
-IG-EBM: interaction-graph-forced EBM.
+IG-EBM: Interaction-Guided EBM.
 
 Reads the empirical interaction graph produced upstream for a cohort
 (`MIMIC_IV/saved_data/interactions/top_interactions.csv` -- one row per
