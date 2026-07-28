@@ -23,12 +23,15 @@ _LAZY_WRAPPERS = {
     'gaminet': ('ml_model_training.model_wrappers.gaminet_wrapper', 'GAMINetWrapperClassifier'),
     'igann':   ('ml_model_training.model_wrappers.igann_wrapper',   'IGANNWrapperClassifier'),
     'nam':     ('ml_model_training.model_wrappers.nam_wrapper',     'NAMWrapperClassifier'),
-    'dgam':    ('ml_model_training.model_wrappers.dgam_wrapper',    'DGAMClassifier'),
+    'dgam':    ('ml_model_training.model_wrappers.dl_gam_wrapper', 'DLGAMClassifier'),
     'mgam':    ('ml_model_training.model_wrappers.mgam_wrapper',    'MGAMClassifier'),
+    'sstgam':  ('ml_model_training.model_wrappers.sstgam_wrapper',  'SSTGAMClassifier'),
+    'he_ebm':  ('ml_model_training.model_wrappers.he_ebm_wrapper',  'HEEBMClassifier'),
+    'ig_ebm':  ('ml_model_training.model_wrappers.ig_ebm_wrapper',  'IGEBMClassifier'),
 }
 
 # Models whose random_state is handled internally by their wrapper.
-_WRAPPER_MODELS = frozenset(['gam', 'ebm', 'gaminet', 'igann', 'nam', 'dgam', 'mgam'])
+_WRAPPER_MODELS = frozenset(['gam', 'ebm', 'gaminet', 'igann', 'nam', 'dgam', 'mgam', 'sstgam', 'he_ebm', 'ig_ebm'])
 
 
 def _load_wrapper(key: str):
@@ -70,7 +73,7 @@ class MLModelFactory:
     def create_model(cls, model_type: str, grid_search: bool = False, results_path: str = None, cohort: str = None):
         """Create an ML model of the specified type."""
 
-        model_type_lower = model_type.lower().replace(' ', '_')
+        model_type_lower = model_type.lower().replace(' ', '_').replace('-', '_')
         model_class = cls._get_model_class(model_type_lower)
 
         model_config = MODEL_PARAMS.get(model_type, {})
@@ -99,6 +102,12 @@ class MLModelFactory:
             os.makedirs(os.path.join(train_dir, "tmp"), exist_ok=True)
             model_params['train_dir'] = train_dir
             model_params['verbose'] = False
+
+        if model_type_lower in ('he_ebm', 'ig_ebm'):
+            # HE-EBM/IG-EBM have no hyperparameters of their own for the EBM
+            # backbone — they pull BEST_PARAMS['EBM'][cohort] internally, so
+            # they need the cohort name rather than tuned params for that part.
+            model_params['cohort'] = cohort
 
         return model_class(**model_params)
 

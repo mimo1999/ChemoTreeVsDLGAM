@@ -2,6 +2,18 @@
 Main entry point for ML model training.
 """
 
+try:
+    # Import torch before imblearn (pulled in below via data_loader) claims
+    # the process's OpenMP/MKL DLL slot first — on Windows, loading imblearn
+    # before torch can leave torch's own bundled runtime unable to
+    # initialize (WinError 1114) the first time a torch-based wrapper
+    # (NAM, GAMINET, IGANN) is lazily loaded deep inside training. Best
+    # effort only: if torch isn't installed at all, this is a no-op and
+    # those wrappers will simply fail their own import later, as normal.
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
 import argparse
 import pandas as pd
 import numpy as np
@@ -164,11 +176,12 @@ class MLTrainingPipeline:
                     X_train, Y_train, subj_ids_train, seed=RANDOM_SEED
                 )
 
-            # EBM without oversampling: use balanced sample_weight so the model
-            # sees proper class penalties while its internal early stopping val
-            # split remains uncontaminated by duplicated positives.
+            # EBM/HE-EBM/IG-EBM/SSTGAM without oversampling: use balanced
+            # sample_weight so the model sees proper class penalties while its
+            # internal early stopping val split remains uncontaminated by
+            # duplicated positives.
             sample_weight = None
-            if self.model_type == 'EBM' and self.oversampling_method != 'minority':
+            if self.model_type in ('EBM', 'HE-EBM', 'IG-EBM', 'SSTGAM') and self.oversampling_method != 'minority':
                 sample_weight = compute_sample_weight("balanced", y=np.asarray(Y_train))
 
             test_metrics, best_params = self.trainer.train_model(
@@ -190,7 +203,7 @@ def main():
     parser.add_argument('--model_type', type=str,
                        choices=['Logistic Regression', 'Random Forest', 'Gradient Boosting',
                                 'Xgboost', 'CatBoost', 'GAM', 'EBM', 'GAMINET', 'IGANN',
-                                'NAM', 'DGAM', 'FGAM', 'MVGAM', 'MGAM'],
+                                'NAM', 'DGAM', 'MGAM', 'SSTGAM', 'HE-EBM', 'IG-EBM'],
                        default='Random Forest')
     parser.add_argument('--features', nargs='+', default=['LAB', 'DEMO'],
                        help='List of feature types (e.g., LAB DEMO)')

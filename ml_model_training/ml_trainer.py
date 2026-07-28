@@ -150,9 +150,9 @@ class MLTrainer:
     def _train_direct(self, model, X_train, Y_train, sample_weight=None, val_set=None):
         """Direct training with grid_search = False."""
 
-        # Wrappers that accept feature_names (GAM, EBM, GAMINET, IGANN, NAM, DGAM, FGAM, MVGAM)
-        # receive column names so their internals can label features.
-        _WRAPPER_TYPES = ("GAM", "EBM", "GAMINET", "IGANN", "NAM", "DGAM", "FGAM", "MVGAM")
+        # Wrappers that accept feature_names (GAM, EBM, GAMINET, IGANN, NAM, DGAM, MGAM,
+        # SSTGAM, HE-EBM, IG-EBM) receive column names so their internals can label features.
+        _WRAPPER_TYPES = ("GAM", "EBM", "GAMINET", "IGANN", "NAM", "DGAM", "MGAM", "SSTGAM", "HE-EBM", "IG-EBM")
         if self.model_type in _WRAPPER_TYPES and hasattr(X_train, "columns"):
             fit_kwargs = {'feature_names': list(X_train.columns)}
             if sample_weight is not None:
