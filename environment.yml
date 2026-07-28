@@ -8,7 +8,7 @@ dependencies:
   - python=3.10
   - imbalanced-learn
   - lightgbm
-  - scikit-learn=1.0.2
+  - scikit-learn=1.5.2
   - matplotlib
   - ipykernel
   - ipywidgets
@@ -28,4 +28,12 @@ dependencies:
       - torchaudio==2.0.1 --index-url https://download.pytorch.org/whl/cu117
       - transformers==4.35.2
       - pyyaml
+      # pygam 0.8.0 needed a numpy/scipy compat shim (np.int/np.bool/np.float,
+      # scipy sparse .A) that 0.12.0 no longer needs -- pin >=0.12.0.
+      - pygam==0.12.0
+      # piml 0.6.0.post2 (latest on PyPI) calls sklearn's removed
+      # BaseEstimator._validate_data. scikit-learn=1.5.2 above is pinned
+      # specifically to keep that method available; nothing else in this
+      # pipeline requires scikit-learn>=1.6.
+      - piml==0.6.0.post2
 

@@ -31,3 +31,11 @@ num_inner_folds = 3
 
 RANDOM_SEED = 42
 
+# Demographic covariates present in every feature matrix in addition to the
+# lab-derived columns (see feature_processing/feature_generator.py:
+# demo_csv=grp[['age', 'gender']]). GAM-family wrappers need to know which
+# static columns are continuous (get a smooth spline term) vs categorical
+# (get a factor/dummy term) — defined once here so every wrapper agrees.
+STATIC_SPLINE_FEATURES = ("age",)
+STATIC_CATEGORICAL_FEATURES = ("gender",)
+
