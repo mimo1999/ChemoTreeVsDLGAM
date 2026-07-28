@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._training import make_validation_split
+from ._training import make_validation_split, weighted_log_loss
 from .bases import make_rbf_centers, rbf_np, second_diff_matrix_np
 from .normalization import apply_value_normalization, fit_value_normalization, static_stats
 
@@ -15,12 +15,8 @@ _RIDGE = 1e-6
 class SharedShapeTemporalGAMBoost:
     """Cyclic Newton boosting over smooth value-time feature surfaces.
 
-    ``outer_bags`` bootstrap-resamples the training rows independently
-    ``outer_bags`` times (the validation split is fixed across bags, so
-    early stopping is judged consistently); each bag's fitted coefficients
-    are averaged at the end. This is the same bagging/variance-reduction
-    step EBM uses, reintroduced 2026-07-26 after being removed in an
-    earlier simplification pass -- see ``fit``'s docstring for why.
+    ``outer_bags`` bagged fits (fixed validation split, bootstrapped
+    training rows) are averaged at the end, as in EBM.
     """
 
     def __init__(
@@ -114,14 +110,6 @@ class SharedShapeTemporalGAMBoost:
         return temporal_design, static_design
 
     @staticmethod
-    def _log_loss(target, probability, weight) -> float:
-        probability = np.clip(probability, 1e-7, 1.0 - 1e-7)
-        return float(-np.average(
-            target * np.log(probability) + (1.0 - target) * np.log(1.0 - probability),
-            weights=weight,
-        ))
-
-    @staticmethod
     def _update_block(preconditioners, train_design, validation_design,
                       coefficients, train_score, validation_score,
                       target, sample_weight, learning_rate):
@@ -170,9 +158,7 @@ class SharedShapeTemporalGAMBoost:
         )
         static_penalty = self._static_penalty(self.n_static_bases, self.static_penalty)
 
-        # Validation split fixed across all bags -- every bag's early stopping
-        # is judged on the identical held-out rows, only the bootstrap-
-        # resampled TRAINING rows differ bag to bag.
+        # Fixed validation split; only the bootstrapped training rows vary by bag.
         train_indices, validation_indices = make_validation_split(
             target, self.val_fraction, self.random_state
         )
@@ -182,7 +168,7 @@ class SharedShapeTemporalGAMBoost:
         accumulated_temporal = None
         accumulated_static = None
         self.best_rounds_ = []
-        for bag in range(self.outer_bags):
+        for _ in range(self.outer_bags):
             fit_indices = (train_indices if self.outer_bags == 1
                           else rng.choice(train_indices, size=train_indices.size, replace=True))
             intercept, temporal_coefficients, static_coefficients, best_round = self._fit_one_bag(
@@ -244,20 +230,18 @@ class SharedShapeTemporalGAMBoost:
             fit_score += self.learning_rate * intercept_update
             validation_score += self.learning_rate * intercept_update
 
-            self._update_block(
-                temporal_preconditioners, fit_temporal, validation_temporal,
-                temporal_coefficients, fit_score, validation_score,
-                fit_target, fit_weight, self.learning_rate,
-            )
+            blocks = [(temporal_preconditioners, fit_temporal, validation_temporal, temporal_coefficients)]
             if static_coefficients is not None:
+                blocks.append((static_preconditioners, fit_static, validation_static, static_coefficients))
+            for preconditioners, fit_design, validation_design, coefficients in blocks:
                 self._update_block(
-                    static_preconditioners, fit_static, validation_static,
-                    static_coefficients, fit_score, validation_score,
+                    preconditioners, fit_design, validation_design,
+                    coefficients, fit_score, validation_score,
                     fit_target, fit_weight, self.learning_rate,
                 )
 
             validation_probability = 1.0 / (1.0 + np.exp(-validation_score))
-            validation_loss = self._log_loss(validation_target, validation_probability, validation_weight)
+            validation_loss = weighted_log_loss(validation_target, validation_probability, validation_weight)
             if validation_loss < best_loss - 1e-6:
                 best_loss = validation_loss
                 best_state = (intercept, temporal_coefficients.copy(),

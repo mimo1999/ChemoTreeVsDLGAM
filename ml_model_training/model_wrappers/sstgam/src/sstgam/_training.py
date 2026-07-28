@@ -34,3 +34,12 @@ def make_validation_split(target: np.ndarray, fraction: float, random_state: int
     train_mask = np.ones(n_samples, dtype=bool)
     train_mask[validation_indices] = False
     return indices[train_mask], validation_indices
+
+
+def weighted_log_loss(target: np.ndarray, probability: np.ndarray, weight: np.ndarray) -> float:
+    """Weighted binary cross-entropy loss."""
+    probability = np.clip(probability, 1e-7, 1.0 - 1e-7)
+    return float(-np.average(
+        target * np.log(probability) + (1.0 - target) * np.log(1.0 - probability),
+        weights=weight,
+    ))
