@@ -1,5 +1,7 @@
 # FLabBench - Chemotherapy Side Effect Prediction Pipeline
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21645197.svg)](https://doi.org/10.5281/zenodo.21645197)
+
 This repository provides a reproducible pipeline to:
 
 - Extract cohorts from **MIMIC-IV** and a **Code dataset from a MII node** (Erlangen University Hospital, UKEr) for patients with cancer diagnoses undergoing chemotherapy.  
